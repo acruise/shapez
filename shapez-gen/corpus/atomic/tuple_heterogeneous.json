@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Geographic point as [longitude, latitude, elevation]",
+  "description": "Fixed-arity heterogeneous array used as a positional struct without field names. Stresses tuple-vs-bag detection.",
+  "type": "array",
+  "prefixItems": [
+    { "type": "number" },
+    { "type": "number" },
+    { "type": "number" }
+  ],
+  "minItems": 3,
+  "maxItems": 3
+}

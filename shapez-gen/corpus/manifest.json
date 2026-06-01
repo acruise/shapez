@@ -1,0 +1,28 @@
+{
+  "schemas": [
+    {
+      "name": "atomic/scalar_root_int",
+      "dimensions": ["scalar_root_int"]
+    },
+    {
+      "name": "atomic/record_stable",
+      "dimensions": ["record_stable", "leaf_uuid", "leaf_email", "leaf_iso_timestamp"]
+    },
+    {
+      "name": "atomic/record_optional",
+      "dimensions": ["record_optional", "leaf_uuid", "leaf_url"]
+    },
+    {
+      "name": "atomic/map_uuid_keys",
+      "dimensions": ["map_uuid_keys"]
+    },
+    {
+      "name": "atomic/tuple_heterogeneous",
+      "dimensions": ["tuple_heterogeneous"]
+    },
+    {
+      "name": "atomic/polymorphic_array_discriminated",
+      "dimensions": ["polymorphic_array_discriminated", "discriminated_union_object", "leaf_uuid"]
+    }
+  ]
+}

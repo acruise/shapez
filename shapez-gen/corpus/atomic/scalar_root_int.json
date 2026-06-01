@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Top-level integer",
+  "description": "Root value is a plain integer. Stresses scalar-root handling.",
+  "type": "integer"
+}

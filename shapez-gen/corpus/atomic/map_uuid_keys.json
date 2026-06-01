@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Feature flag overrides keyed by user id",
+  "description": "Object whose keys are UUIDs (data, not metadata) and whose values share a stable shape. Stresses the record-vs-map decision.",
+  "type": "object",
+  "minProperties": 2,
+  "maxProperties": 8,
+  "propertyNames": { "format": "uuid" },
+  "additionalProperties": {
+    "type": "object",
+    "required": ["enabled"],
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "rollout_pct": { "type": "integer" }
+    },
+    "additionalProperties": false
+  }
+}

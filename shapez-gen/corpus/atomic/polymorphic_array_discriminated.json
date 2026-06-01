@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Timeline of mixed event types",
+  "description": "Array of polymorphic objects discriminated by a const `type` field. Stresses variant-arm enumeration in array elements.",
+  "type": "array",
+  "minItems": 2,
+  "maxItems": 6,
+  "items": {
+    "oneOf": [
+      {
+        "type": "object",
+        "required": ["type", "post_id", "body"],
+        "properties": {
+          "type": { "const": "post" },
+          "post_id": { "type": "string", "format": "uuid" },
+          "body": { "type": "string" }
+        }
+      },
+      {
+        "type": "object",
+        "required": ["type", "like_id", "target_post_id"],
+        "properties": {
+          "type": { "const": "like" },
+          "like_id": { "type": "string", "format": "uuid" },
+          "target_post_id": { "type": "string", "format": "uuid" }
+        }
+      },
+      {
+        "type": "object",
+        "required": ["type", "follow_id", "target_user_id"],
+        "properties": {
+          "type": { "const": "follow" },
+          "follow_id": { "type": "string", "format": "uuid" },
+          "target_user_id": { "type": "string", "format": "uuid" }
+        }
+      }
+    ]
+  }
+}

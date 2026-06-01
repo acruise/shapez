@@ -1,0 +1,12 @@
+[package]
+name = "shapez-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Curated JSON Schema corpus and value-stream generator for shapez tests"
+
+[dependencies]
+rand.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true

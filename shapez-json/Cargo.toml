@@ -1,0 +1,15 @@
+[package]
+name = "shapez-json"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "JSON feedstock adapter for shapez"
+
+[dependencies]
+shapez = { path = "../shapez" }
+meta-types = { path = "../_meta/rust-types" }
+serde_json.workspace = true
+
+[dev-dependencies]
+shapez-gen = { path = "../shapez-gen" }

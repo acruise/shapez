@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "User with optional profile fields",
+  "description": "Only id is required. Stresses optional-vs-absent fact recording per field.",
+  "type": "object",
+  "required": ["id"],
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "nickname": { "type": "string" },
+    "bio": { "type": "string" },
+    "avatar_url": { "type": "string", "format": "uri" }
+  },
+  "additionalProperties": false
+}
