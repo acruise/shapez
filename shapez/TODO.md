@@ -6,11 +6,11 @@ Status snapshot, immediate next steps, and the agreed analyzer design. See `JSON
 
 Crates landed:
 
-- `shapez` — core types and path DSL. ShapeNode (Type | Variant | Tuple | Absent) layered over `_meta::ValueType`. PathStep (Field | Index) and PathPattern (adds AnyField | AnyIndex) with Display/FromStr/round-trip. Stats with observation_count + exemplar reservoir (no sketches yet). Assertion model (Assertion, AssertionRef, AssertionTarget, AssertionSet). ShapeException + AssertionViolation + ExceptionSink trait. ExceptionSession + ClusterKey + ExceptionEvent + ShapeDelta + CloseReason. `low_entropy_prefix` typed as `PathPattern` (the canonical / map-collapsed form). Analyzer trait stubbed in `ingest.rs`, no logic.
+- `shapez` — core types and path DSL. `ShapeNode` over `_meta::ValueType` plus shape-language meta-nodes (`Variant`, `Tuple`, `Absent`) and rich compound forms (`Array { element }`, `Record { fields }`, `Map { key, value }`) used when children carry shape-language structure ValueType cannot express. `PathStep` / `PathPattern` with Display/FromStr round-trip. `Stats` (observation_count, doc range, exemplar reservoir — no HLL yet). Assertion model + `ShapeException` + `ExceptionSink` trait. `ExceptionSession` + `ClusterKey` + delta protocol. `JsonEventSink` SAX trait + `Analyzer: JsonEventSink + finish()`. `StreamingAnalyzer` implements both: arena-backed dual-view accumulators (record_view K=64 + map_value, positional K=32 + bag_value), Option A lazy variant emergence at leaves, hand-rolled Space-Saving subtree clustering (K=16) per array node, record-vs-map / tuple-vs-bag decisions at `finish()`. Assertion evaluation, exception emission, and session caching not yet wired.
 
-- `shapez-json` — `lower(&serde_json::Value) -> meta_types::value::Value`. Numbers split into i64/u64/f64. Objects lower to `Value::Map` with `MapKey::String`. 11 unit tests + 1 integration test against the corpus pass.
+- `shapez-json` — `drive_document(&mut sink, doc_ordinal, &serde_json::Value)` walks a `serde_json::Value` into any `JsonEventSink`. `lower(&serde_json::Value) -> meta_types::value::Value` retained for the exception-exemplar path. Integration test round-trips all six corpus schemas through the analyzer and asserts the inferred shape; the polymorphic discriminated-array case verifies three variant arms emerge.
 
-- `shapez-gen` — `Corpus::load(dir)` reads `manifest.json` and JSON Schema files; `Generator::new(corpus, seed)` is `Iterator<Item = serde_json::Value>`. Internal `Shape` model parses a subset of JSON Schema (oneOf, anyOf, enum, const, format, prefixItems, additionalProperties + propertyNames). Six atomic corpus entries cover scalar root, record stable, record optional, map UUID keys, tuple heterogeneous, polymorphic array discriminated. 4 integration tests pass.
+- `shapez-gen` — unchanged from the previous status. 4 integration tests pass.
 
 Docs in `shapez/`: `JSON_TILES_ROADMAP.md`, this file.
 
@@ -18,19 +18,15 @@ Docs in `shapez/`: `JSON_TILES_ROADMAP.md`, this file.
 
 In rough order. Each unblocks the next.
 
-1. Define `JsonEventSink` trait in `shapez/src/ingest.rs`. SAX-style with explicit document boundaries, scalar callbacks (null/bool/int/uint/float/string), and array/object begin/key/end. Strings as `&str` at the boundary. This is the analyzer's primary input contract; the `Analyzer` trait shrinks to "anything implementing JsonEventSink."
+1. Implement assertion evaluation and exception emission. Wire `ExceptionSink` into `StreamingAnalyzer`: per-doc falsification at observation, aggregate falsification (record-vs-map tipping point) on threshold crossing.
 
-2. Rework `shapez-json` to provide an `EventDriver` that walks `serde_json::Value` and drives any `JsonEventSink`. Keep `lower()` as the exception-exemplar path.
+2. Add `ExceptionSession` cache with simple LRU policy. Defer 2Q / W-TinyLFU to later.
 
-3. Implement the analyzer (see design below). End goal: ingest a stream of values from the `shapez-gen` corpus and produce a `ShapeNode` tree that matches the schema each value was instantiated from (round-trip property test).
+3. Add the deferred sketches: HyperLogLog for per-leaf value cardinality, HLL for object-key cardinality, Space-Saving for top-K values. Drives the cluster-aware ROI advisor and column-promotion advice; not load-bearing for shape inference on the current corpus.
 
-4. Add per-step sketches: HyperLogLog for value cardinality, HyperLogLog for object key cardinality, Space-Saving for top-K values. Probably the `hyperloglogplus` crate; Space-Saving hand-rolled (small).
+4. Sampling-driven analysis (BTRBlocks-style three tiers, adaptive sample rate). Currently the analyzer walks every event of every document.
 
-5. Implement the record-vs-map decision (using key HLL + record-view overflow), tuple-vs-bag decision (using positional purity vs bag entropy).
-
-6. Implement assertion evaluation and exception emission. Wire ExceptionSink into the analyzer.
-
-7. Add ExceptionSession cache with simple LRU policy. Defer 2Q / W-TinyLFU to later.
+5. Epoch / tile boundaries and the two-tier (tile-local + global) sketch model.
 
 After all that we are at roadmap phase 1 plus a chunk of phase 2 stat collection. The cluster-aware ROI advisor (Phase 4.5) comes after.
 

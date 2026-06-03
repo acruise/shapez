@@ -471,6 +471,7 @@ name = "shapez-json"
 version = "0.1.0"
 dependencies = [
  "meta-types",
+ "rand",
  "serde_json",
  "shapez",
  "shapez-gen",

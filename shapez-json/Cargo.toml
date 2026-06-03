@@ -13,3 +13,4 @@ serde_json.workspace = true
 
 [dev-dependencies]
 shapez-gen = { path = "../shapez-gen" }
+rand.workspace = true
