@@ -248,16 +248,29 @@ This applies equally to a first-time pass and to a re-analysis with adjusted pol
 
 ### Time predicates across sources
 
-Run scope is rarely "every byte ever stored." Operators want windows — "the last 24 hours," "October 2023," "between when we deployed v2.1 and now." The machinery exposes a uniform `TimePredicate { start, end }` that each source interprets in whatever way its backend supports:
+Run scope is rarely "every byte ever stored." Operators want windows — "the last 24 hours," "October 2023," "between when we deployed v2.1 and now." The machinery exposes a uniform `TimePredicate { start, end }`. The interesting question is *where the timestamp comes from* on each record, which decomposes into two strategies every format / source needs to expose:
 
-- **`JsonlDir`** filters by file modification time. JSONL has no row-level metadata so the granularity is per-file; `.within(predicate)` excludes files whose `mtime` falls outside the window.
-- **Cloud / object_store** sources filter by object last-modified header — server-side where the API allows, client-side otherwise.
-- **Parquet / ORC** sources filter by file modtime *and*, if the schema includes a designated time column, push the predicate into the column scan as a min/max stat filter.
-- **SQL** sources synthesize a `WHERE` clause on an operator-designated time column.
+1. **Extraction** — where to find the raw timestamp value for this record. Strategies vary enormously by backend:
+   - **File metadata** (the default for filesystem sources without per-record metadata): `JsonlDir`, `CsvDir`, et al. use file mtime, at per-file granularity.
+   - **Object-store metadata**: the `Last-Modified` header on each blob, per-object granularity.
+   - **Native typed column / field**: Parquet/ORC files often have a self-describing timestamp column; SQL queries name a column with the database's native time type; Avro records with `logicalType: timestamp-millis` carry the semantics in the schema.
+   - **Broker / framing metadata**: Kafka messages carry a broker-assigned timestamp on each record independent of the message body — the default for Kafka sources without a designated content time.
+   - **Path into the decoded value**: a `shapez::path::Path` (`.event.ts`, `.created_at`) for sources where the timestamp lives in the payload. Composes with `.at()` — the time field can be anywhere in the document, including outside the analyzed subtree.
+   - **Regex on raw bytes**: log lines where the timestamp is text at a known prefix position. The adapter declares the pattern and capture group.
+2. **Parsing / interpretation** — how to lift the raw extracted value into a `SystemTime`. This is data-specific, not source-specific, and the same parser usually applies across many sources:
+   - **Epoch integers**: `epoch_seconds` / `epoch_millis` / `epoch_micros` / `epoch_nanos`. The same windows `NumericStats::epoch_guess` uses to *detect* an epoch field at analysis time are the parsers an operator would name to *consume* one.
+   - **ISO-8601 strings**: the `StringFormat::IsoTimestamp` detector's permissive variants (with `T` or space separator, optional fractional seconds, optional Z / offset) — same logic running in reverse.
+   - **Native typed**: no parsing needed when the source delivers an already-typed timestamp (Parquet column, SQL column with the right type).
+   - **Custom format strings**: `strftime`-shaped patterns for the long tail of bespoke timestamps. Operator-supplied.
 
-The trait stays uniform (`source.within(predicate)`) but the semantics vary because the backends do. Documenting how each source interprets the predicate is part of the source's contract — the `analyze` function itself remains backend-blind.
+The trait surface stays uniform — `source.within(predicate)` — but each source exposes builder methods for the strategy slot: `.with_time_field(path, parser)`, `.with_broker_time()`, `.with_column("ingested_at")`, etc. Default strategies are the no-config common case; overrides handle the rest.
 
-A future refinement allows the predicate to designate a JSON-path-and-parser pair (e.g. *"the value at `.ts` parsed as epoch millis"*) so content timestamps can drive the filter for sources whose backend metadata is absent or lying. Until that lands, file / object / row metadata is the only honest time signal.
+Two cross-cutting consequences worth naming:
+
+- **The analyzer's format detectors double as advisors for this configuration.** A field that `NumericStats::epoch_guess` flagged as "looks like epoch millis" is by construction a candidate for `.with_time_field("<that path>", EpochMillis)` on the next pass. The advice loop runs naturally from analysis output to time-extraction config to next analysis.
+- **Sources must handle unparseable values explicitly.** A time field whose parser fails on some records yields `Option<SystemTime>` per record. Sources need to declare a policy — include silently, exclude silently, count and surface in `AnalysisOutcome` — and document the choice. A silent exclusion that drops 30% of records is the kind of mistake an operator finds only by accident.
+
+Until per-record extraction is wired up, file / object / row metadata is the only honest time signal across all current sources.
 
 ### Retention and replay
 
