@@ -96,20 +96,24 @@ fn map_uuid_keys_infers_map() {
 }
 
 #[test]
-fn tuple_heterogeneous_infers_tuple() {
+fn tuple_heterogeneous_infers_mixed_tuple() {
     let shape = analyze_schema("atomic/tuple_heterogeneous", 1000, 5);
     let positions = match &shape.kind {
         ShapeKind::Tuple { positions } => positions,
         other => panic!("expected Tuple, got {other:?}"),
     };
-    assert_eq!(positions.len(), 3);
-    for (i, p) in positions.iter().enumerate() {
-        assert!(
-            matches!(p.kind, ShapeKind::Type(ValueType::F64)),
-            "position {i} should be F64, got {:?}",
-            p.kind,
-        );
-    }
+    let kinds: Vec<&ValueType> = positions
+        .iter()
+        .map(|p| match &p.kind {
+            ShapeKind::Type(vt) => vt,
+            other => panic!("position should be scalar, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![&ValueType::String, &ValueType::F64, &ValueType::I64, &ValueType::Bool],
+        "expected [string, f64, i64, bool], got {kinds:?}",
+    );
 }
 
 #[test]

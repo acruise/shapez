@@ -62,9 +62,14 @@ fn main() {
         }
         drop(writer);
 
+        let report = analyzer.report();
+        let report_path = out_dir.join(format!("{safe_name}.report.txt"));
+        fs::write(&report_path, &report).expect("write report");
+
         let shape = analyzer.finish();
         println!("=== {} ({} records) ===", entry.name, count);
         println!("jsonl:    {}", path.display());
+        println!("report:   {}", report_path.display());
         println!("inferred: {}", format_shape(&shape));
         println!();
     }

@@ -219,6 +219,220 @@ impl StreamingAnalyzer {
         self.doc_count
     }
 
+    /// Render a human-readable description of the analyzer's current
+    /// state: per-path observation counts, the dual-view accumulators,
+    /// the decision that would be made at finalization (record vs map,
+    /// tuple vs bag), and the top-K element clusters at each array.
+    /// Walks `&self` so callers can produce a report without consuming
+    /// the analyzer.
+    pub fn report(&self) -> String {
+        let mut out = String::new();
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            &mut out,
+            "shapez analyzer report — {} documents",
+            self.doc_count
+        );
+        let _ = writeln!(&mut out);
+        self.write_node(&mut out, self.root, ".", 0);
+        out
+    }
+
+    fn write_node(&self, out: &mut String, id: NodeId, path: &str, depth: usize) {
+        use std::fmt::Write as _;
+        let n = &self.arena[id];
+        let indent = "  ".repeat(depth);
+        let _ = writeln!(
+            out,
+            "{indent}{path}  ({} obs, docs {}..{})",
+            n.obs, n.first_doc, n.last_doc,
+        );
+
+        let mut arms: Vec<&'static str> = Vec::new();
+        if !n.scalar_arms.is_empty() {
+            arms.push("scalar");
+        }
+        if n.object.is_some() {
+            arms.push("object");
+        }
+        if n.array.is_some() {
+            arms.push("array");
+        }
+        if arms.len() > 1 {
+            let _ = writeln!(
+                out,
+                "{indent}  variant arms observed: {}",
+                arms.join(", ")
+            );
+        }
+
+        if !n.scalar_arms.is_empty() {
+            let total: u64 = n.scalar_arms.values().sum();
+            let _ = writeln!(out, "{indent}  scalar arms:");
+            for (kind, count) in &n.scalar_arms {
+                let pct = 100.0 * (*count as f64) / (total.max(1) as f64);
+                let _ = writeln!(
+                    out,
+                    "{indent}    {:?}  ×{}  ({:.1}%)",
+                    kind, count, pct
+                );
+            }
+        }
+
+        if let Some(obj) = &n.object {
+            self.write_object(out, obj, path, depth + 1);
+        }
+        if let Some(arr) = &n.array {
+            self.write_array(out, arr, path, depth + 1);
+        }
+    }
+
+    fn write_object(&self, out: &mut String, obj: &ObjectAcc, parent_path: &str, depth: usize) {
+        use std::fmt::Write as _;
+        let indent = "  ".repeat(depth);
+        let decision = decide_object(obj);
+        let total = obj.obs.max(1);
+        let mean_keys = obj.key_count_sum as f64 / total as f64;
+
+        let _ = writeln!(
+            out,
+            "{indent}object: {} obs, {} unique field(s), mean {:.1} keys/doc, record_view {}",
+            obj.obs,
+            obj.field_order.len(),
+            mean_keys,
+            if obj.record_alive { "alive" } else { "DROPPED" },
+        );
+        match &decision {
+            ObjectDecision::Record { reason } => {
+                let _ = writeln!(out, "{indent}decision: RECORD  ({reason})");
+            }
+            ObjectDecision::Map { reason } => {
+                let _ = writeln!(out, "{indent}decision: MAP     ({reason})");
+            }
+        }
+
+        match decision {
+            ObjectDecision::Record { .. } => {
+                let _ = writeln!(out, "{indent}fields:");
+                for name in &obj.field_order {
+                    let cid = obj.fields[name];
+                    let child_obs = self.arena[cid].obs;
+                    let presence = 100.0 * child_obs as f64 / total as f64;
+                    let nullable = child_obs < obj.obs;
+                    let null_tag = if nullable { "  nullable" } else { "  required" };
+                    let _ = writeln!(
+                        out,
+                        "{indent}  .{name}  ({child_obs}/{} = {:.1}%{null_tag})",
+                        obj.obs, presence,
+                    );
+                    let cp = if parent_path == "." {
+                        format!(".{name}")
+                    } else {
+                        format!("{parent_path}.{name}")
+                    };
+                    self.write_node(out, cid, &cp, depth + 2);
+                }
+            }
+            ObjectDecision::Map { .. } => {
+                let wildcard = if parent_path == "." {
+                    ".*".to_string()
+                } else {
+                    format!("{parent_path}.*")
+                };
+                let _ = writeln!(out, "{indent}canonical pattern: {wildcard}");
+                if obj.record_alive && !obj.field_order.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{indent}(record_view still alive at {} unique keys — kept for reporting)",
+                        obj.field_order.len()
+                    );
+                }
+                let _ = writeln!(out, "{indent}map_value @ {wildcard}");
+                self.write_node(out, obj.map_value, &wildcard, depth + 1);
+            }
+        }
+    }
+
+    fn write_array(&self, out: &mut String, arr: &ArrayAcc, parent_path: &str, depth: usize) {
+        use std::fmt::Write as _;
+        let indent = "  ".repeat(depth);
+        let total = arr.obs.max(1);
+        let decision = decide_array(arr);
+
+        let min = if arr.min_length == u32::MAX { 0 } else { arr.min_length };
+        let mean_len = arr.length_sum as f64 / total as f64;
+        let _ = writeln!(
+            out,
+            "{indent}array: {} obs, lengths {}..{}, mean {:.1}/doc, positional_view {}",
+            arr.obs,
+            min,
+            arr.max_length,
+            mean_len,
+            if arr.positional_alive { "alive" } else { "DROPPED" },
+        );
+        let _ = writeln!(out, "{indent}length distribution:");
+        for (len, count) in &arr.length_histogram {
+            let pct = 100.0 * (*count as f64) / total as f64;
+            let _ = writeln!(out, "{indent}  len={len}  ×{count}  ({:.1}%)", pct);
+        }
+
+        let cluster = &arr.element_cluster;
+        let entries = cluster.entries();
+        let _ = writeln!(
+            out,
+            "{indent}element cluster (Space-Saving cap={}): {} arms, {} evictions",
+            cluster.cap,
+            entries.len(),
+            cluster.evictions,
+        );
+        for (sig, count) in &entries {
+            let mut sig_str = String::new();
+            write_sig(&mut sig_str, sig);
+            let _ = writeln!(out, "{indent}  ×{count}  {sig_str}");
+        }
+
+        match &decision {
+            ArrayDecision::Tuple { mode_len, mode_share } => {
+                let _ = writeln!(
+                    out,
+                    "{indent}decision: TUPLE  (mode_len={mode_len}, mode_share={:.1}%)",
+                    100.0 * mode_share,
+                );
+                let _ = writeln!(out, "{indent}positions:");
+                for (i, cid) in arr.positional.iter().take(*mode_len as usize).enumerate() {
+                    let cp = if parent_path == "." {
+                        format!(".[{i}]")
+                    } else {
+                        format!("{parent_path}[{i}]")
+                    };
+                    self.write_node(out, *cid, &cp, depth + 1);
+                }
+            }
+            ArrayDecision::Bag { reason } => {
+                let _ = writeln!(out, "{indent}decision: BAG    ({reason})");
+                let wildcard = if parent_path == "." {
+                    ".[*]".to_string()
+                } else {
+                    format!("{parent_path}[*]")
+                };
+                let _ = writeln!(out, "{indent}canonical pattern: {wildcard}");
+                let _ = writeln!(out, "{indent}bag_value @ {wildcard}");
+                self.write_node(out, arr.bag_value, &wildcard, depth + 1);
+                if arr.positional_alive && !arr.positional.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{indent}(positional view also retained at {} positions \u{2014} for completeness)",
+                        arr.positional.len()
+                    );
+                    for (i, cid) in arr.positional.iter().enumerate() {
+                        let obs = self.arena[*cid].obs;
+                        let _ = writeln!(out, "{indent}  [{i}] {} obs (not used by bag decision)", obs);
+                    }
+                }
+            }
+        }
+    }
+
     fn alloc(&mut self) -> NodeId {
         alloc_node(&mut self.arena)
     }
@@ -373,6 +587,105 @@ fn alloc_node(arena: &mut Vec<Node>) -> NodeId {
     id
 }
 
+// ---------------------------------------------------------------------------
+// Decisions (shared between Finalizer and the report printer)
+// ---------------------------------------------------------------------------
+
+enum ObjectDecision {
+    Record { reason: &'static str },
+    Map { reason: &'static str },
+}
+
+enum ArrayDecision {
+    Tuple { mode_len: u32, mode_share: f64 },
+    Bag { reason: &'static str },
+}
+
+fn decide_object(obj: &ObjectAcc) -> ObjectDecision {
+    let total = obj.obs.max(1);
+    let unique = obj.field_order.len();
+    let mean_keys = obj.key_count_sum as f64 / total as f64;
+
+    if !obj.record_alive {
+        return ObjectDecision::Map { reason: "record_view OVERFLOWED at cap" };
+    }
+    if unique >= 16 && (unique as f64) > mean_keys.max(1.0) * 4.0 {
+        return ObjectDecision::Map {
+            reason: "unique key count >> typical per-doc keys",
+        };
+    }
+    ObjectDecision::Record { reason: "stable low-cardinality key set" }
+}
+
+fn decide_array(arr: &ArrayAcc) -> ArrayDecision {
+    let total = arr.obs.max(1);
+    let (mode_len, mode_count) = arr
+        .length_histogram
+        .iter()
+        .max_by_key(|(_, c)| **c)
+        .map(|(l, c)| (*l, *c))
+        .unwrap_or((0, 0));
+    let mode_share = mode_count as f64 / total as f64;
+    let positional_useful = arr.positional_alive && !arr.positional.is_empty();
+    let small_mode = mode_len > 0 && mode_len <= 16;
+    let tight = mode_share >= 0.9;
+
+    if positional_useful && small_mode && tight {
+        return ArrayDecision::Tuple { mode_len, mode_share };
+    }
+    let reason = if !positional_useful {
+        "positional view unusable"
+    } else if !small_mode {
+        "mode length too large for tuple"
+    } else {
+        "arity not tight enough"
+    };
+    ArrayDecision::Bag { reason }
+}
+
+fn write_sig(out: &mut String, sig: &Sig) {
+    match sig {
+        Sig::Empty => out.push_str("empty"),
+        Sig::Scalar(k) => out.push_str(scalar_name(*k)),
+        Sig::Array(inner) => {
+            out.push('[');
+            write_sig(out, inner);
+            out.push(']');
+        }
+        Sig::Record(fields) => {
+            out.push_str("record{");
+            for (i, (name, _)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(name);
+            }
+            out.push('}');
+        }
+        Sig::Variant(arms) => {
+            out.push('(');
+            for (i, a) in arms.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(" | ");
+                }
+                write_sig(out, a);
+            }
+            out.push(')');
+        }
+    }
+}
+
+fn scalar_name(k: ScalarKind) -> &'static str {
+    match k {
+        ScalarKind::Null => "null",
+        ScalarKind::Bool => "bool",
+        ScalarKind::I64 => "i64",
+        ScalarKind::U64 => "u64",
+        ScalarKind::F64 => "f64",
+        ScalarKind::String => "string",
+    }
+}
+
 impl Default for StreamingAnalyzer {
     fn default() -> Self {
         Self::new()
@@ -510,16 +823,7 @@ impl Finalizer {
     }
 
     fn build_object(&self, obj: &ObjectAcc, n: &Node) -> ShapeNode {
-        let total = obj.obs.max(1);
-        let unique = obj.field_order.len();
-        let mean_keys = obj.key_count_sum as f64 / total as f64;
-
-        let force_map = !obj.record_alive;
-        let map_by_cardinality = obj.record_alive
-            && unique >= 16
-            && (unique as f64) > mean_keys.max(1.0) * 4.0;
-
-        if force_map || map_by_cardinality {
+        if matches!(decide_object(obj), ObjectDecision::Map { .. }) {
             let mut value_shape = self.build(obj.map_value);
             if matches!(value_shape.kind, ShapeKind::Absent) {
                 let ids: Vec<NodeId> = obj
@@ -589,19 +893,7 @@ impl Finalizer {
     }
 
     fn build_array(&self, arr: &ArrayAcc, n: &Node) -> ShapeNode {
-        let total = arr.obs.max(1);
-        let (mode_len, mode_count) = arr
-            .length_histogram
-            .iter()
-            .max_by_key(|(_, c)| **c)
-            .map(|(l, c)| (*l, *c))
-            .unwrap_or((0, 0));
-        let mode_share = mode_count as f64 / total as f64;
-        let positional_useful = arr.positional_alive && !arr.positional.is_empty();
-        let small_mode = mode_len > 0 && mode_len <= 16;
-        let tight = mode_share >= 0.9;
-
-        if positional_useful && small_mode && tight {
+        if let ArrayDecision::Tuple { mode_len, .. } = decide_array(arr) {
             let take = (mode_len as usize).min(arr.positional.len());
             let positions: Vec<ShapeNode> = arr
                 .positional

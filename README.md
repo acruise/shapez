@@ -2,7 +2,7 @@
 
 Structural shape inference over streams of semi-structured values. shapez observes a stream of `meta_types::value::Value` documents and produces an inferred `ShapeNode` tree -- a description of the data's recurring structure -- plus a stream of `ShapeException`s when user-declared assertions about that structure are falsified.
 
-It is the schema-inference and columnar-promotion-advice layer for notochord. The north star is the JSON Tiles approach (Durner, Leis, Neumann, SIGMOD 2021): infer per-tile schemas, promote frequent paths into columns, keep the long tail in residual binary JSON. shapez aims to be a JSON-Tiles ancestor that carries strictly more shape information -- explicit variants, record-vs-map decisions, tuple-vs-bag decisions, and user assertions -- through the same pipeline. See `shapez/JSON_TILES_ROADMAP.md` for the phased bridge plan and `shapez/TODO.md` for current status and the analyzer design.
+It is a schema-inference and columnar-promotion-advice layer for downstream analytical stores. The north star is the JSON Tiles approach (Durner, Leis, Neumann, SIGMOD 2021): infer per-tile schemas, promote frequent paths into columns, keep the long tail in residual binary JSON. shapez aims to be a JSON-Tiles ancestor that carries strictly more shape information -- explicit variants, record-vs-map decisions, tuple-vs-bag decisions, and user assertions -- through the same pipeline. See `shapez/JSON_TILES_ROADMAP.md` for the phased bridge plan and `shapez/TODO.md` for current status and the analyzer design.
 
 ## Status
 
@@ -48,15 +48,16 @@ shapez is supervised where JSON Tiles is not. An `Assertion` declares an expecta
 
 - Schema discovery for semi-structured streams. Point shapez at a stream of JSON (or any feedstock with an adapter) and get back an inferred shape tree, including which object steps are really data-keyed maps and which arrays are really tuples -- distinctions a naive path-counting inferencer misses.
 
-- Columnar promotion advice for notochord. The end goal: produce a `PromotionPlan` saying which `(path, type)` pairs a tile should hoist into typed columns, with the long tail left in residual binary JSON. Map-collapsed wildcards still promote leafward (`.flags.*.enabled` becomes a column behind a map step), tuples promote per position, and variants promote to one nullable column per arm -- all stronger than JSON Tiles' "dominant type wins, rest to JSONB" rule.
+- Columnar promotion advice for downstream stores. The end goal: produce a `PromotionPlan` saying which `(path, type)` pairs a tile should hoist into typed columns, with the long tail left in residual binary JSON. The same plan also drives Spark / Iceberg shredded-variant emit: promoted paths become typed sub-columns of the variant, the rest stays in the variant blob. Map-collapsed wildcards still promote leafward (`.flags.*.enabled` becomes a column behind a map step), tuples promote per position, and variants promote to one nullable column per arm -- all stronger than JSON Tiles' "dominant type wins, rest to JSONB" rule.
 
 - Data-contract monitoring. Declare assertions about expected structure and receive a structured, de-duplicated exception stream when live data violates them, with exemplar back-pointers into the input for triage. This is usable from phase 1, independent of any columnar storage.
 
-- Optimizer statistics. Per-tile HyperLogLog sketches and frequency counters aggregated to the relation level, feeding query planners (notochord's own buffer operations and external consumers such as Substrait).
+- Optimizer statistics. Per-tile HyperLogLog sketches and frequency counters aggregated to the relation level, feeding query planners (including external consumers such as Substrait).
 
 - Drift detection over time. Because epochs decouple dictionary stability from data drift, comparing successive tile schemas surfaces structural drift without needing precise online drift detection.
 
 ## Where to read next
 
+- `shapez/DESIGN.md` -- domain model, goals, non-goals, design tenets, and the stable wire-level contracts.
 - `shapez/TODO.md` -- current status, immediate next steps, and the full analyzer design (input contract, path-stack lifecycle, variant emergence, record-vs-map and tuple-vs-bag heuristics, sampling, epochs, progressive tiered indexing, finalization).
 - `shapez/JSON_TILES_ROADMAP.md` -- the gap analysis against JSON Tiles and the eight-phase bridge plan, including where shapez intentionally leads rather than follows.

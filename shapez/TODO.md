@@ -276,9 +276,9 @@ Operator policy controls promotion between tiers (age threshold, hit-count thres
 
 - Frequent itemset mining (FPGrowth) over canonical path-sets within each tile.
 
-- Cross-tile reordering at partition granularity, with the open question of how it composes with notochord's subject-keying.
+- Cross-tile reordering at partition granularity, with the open question of how it composes with host-system partition keys (e.g. subject-keying schemes).
 
-- Storage layer integration: PromotionPlan -> notochord buffer module columns. Residual binary JSON format choice (own JSONB vs CBOR/MessagePack).
+- Storage layer integration: PromotionPlan -> host buffer columns and/or Spark/Iceberg shredded-variant sub-columns. Residual binary format choice (own JSONB vs CBOR/MessagePack).
 
 - Optimizer statistics aggregated tile -> relation with LRU-style replacement.
 

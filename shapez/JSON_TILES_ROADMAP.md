@@ -65,33 +65,33 @@ Group K tiles (default 8) into a partition. Mine frequent itemsets at partition 
 
 This is mechanically expensive but the gain is large on streams with poor spatial locality. Concurrency story: each partition reorders independently; readers see a tile only when fully assembled.
 
-Open question: how does reordering compose with notochord's existing subject-keyed buffer? Tile reordering across subjects is presumably wrong (subject identity is load-bearing in notochord's domain). The right composition is probably "tile within a subject" rather than "tile across subjects." Worth deciding before this phase rather than during.
+Open question: how does reordering compose with a host system's partition keys (e.g. subject-keyed buffers)? Tile reordering across partition keys is presumably wrong when key identity is load-bearing in the host's domain. The right composition is probably "tile within a key" rather than "tile across keys." Worth deciding before this phase rather than during.
 
 Dependencies: phase 4.
 
 ### Phase 6: Storage layer integration
 
-The PromotionPlan from phase 3 or 4 starts driving actual columnar promotion in notochord's buffer module. Promoted (path, type) pairs become typed columns following the existing buffer abstractions. Residual JSON stays in a binary JSON column.
+The PromotionPlan from phase 3 or 4 starts driving actual columnar promotion in a host storage layer. Promoted (path, type) pairs become typed columns following the host's column abstractions. Residual JSON stays in a binary JSON column. The same plan also targets Spark / Iceberg shredded-variant emit: promoted paths become typed sub-columns of the variant, residual stays in the variant blob.
 
 Connections worth pulling:
 
 - `meta_types::ValueType` becomes the column type directly. No conversion.
-- The buffer's existing pluggable physical layouts (dictionary-coded, byte-buffer, reference, delta) are the right home for promoted columns. shapez does not need to know about them.
-- Notochord's predicate bitmaps already parallel JSON Tiles' presence bitmaps. Likely shared infrastructure.
+- The host's existing pluggable physical layouts (dictionary-coded, byte-buffer, reference, delta — whatever the embedding system provides) are the right home for promoted columns. shapez does not need to know about them.
+- Hosts with predicate bitmaps gain a direct parallel to JSON Tiles' presence bitmaps. Shared infrastructure where it lines up.
 
-A binary JSON format is needed for the residual. JSON Tiles defines its own (paper section 5) optimized for log(n) object lookups and forward-iterable nested structures. Notochord could adopt CBOR or MessagePack to skip rolling its own, accepting some performance tax on residual access; or invest in a JSONB-like format if residual access is hot. Decide based on residual frequency in target workloads.
+A binary JSON format is needed for the residual on the column-store side. JSON Tiles defines its own (paper section 5) optimized for log(n) object lookups and forward-iterable nested structures. A host could adopt CBOR or MessagePack to skip rolling its own, accepting some performance tax on residual access; or invest in a JSONB-like format if residual access is hot. Decide based on residual frequency in target workloads. The variant-export path uses the Spark/Iceberg variant binary spec instead and has no such choice.
 
-Dependencies: phase 4, plus a buffer-module change in notochord.
+Dependencies: phase 4, plus the relevant emitter (host buffer adapter or variant writer).
 
 ### Phase 7: Optimizer statistics
 
-Per-tile HyperLogLog sketches and frequency counters for promoted paths. Aggregate to the relation level with an LRU-style replacement policy (the paper proposes 256 frequency counters and 64 sketches as a memory bound). These propagate to whatever query planner downstream consumes notochord data, including the notochord's own buffer-level operations and any external optimizer (Substrait, for instance, since notochord already has Substrait wiring).
+Per-tile HyperLogLog sketches and frequency counters for promoted paths. Aggregate to the relation level with an LRU-style replacement policy (the paper proposes 256 frequency counters and 64 sketches as a memory bound). These propagate to whatever query planner downstream consumes the data, including host buffer-level operations and external optimizers (Substrait, for instance).
 
 Dependencies: phase 6, plus a planner / consumer that benefits from the stats. Without a consumer, the stats are dormant infrastructure.
 
 ### Phase 8: Query path
 
-Access-expression push-down into the scan, cast rewriting, tile skipping under null-safe predicates. These are the speedup-realization phases. shapez does not own this work directly; it lives in whatever query engine consumes the buffer (notochord itself, plus external integrations).
+Access-expression push-down into the scan, cast rewriting, tile skipping under null-safe predicates. These are the speedup-realization phases. shapez does not own this work directly; it lives in whatever query engine consumes the buffer (the host system, plus external integrations).
 
 Dependencies: phases 6 and 7.
 
@@ -106,4 +106,4 @@ shapez carries strictly more shape information than JSON Tiles needs. Promoting 
 
 ## What to do first
 
-Phase 1 unblocks every later phase and validates the shape-language design against real input. Phase 2 turns shapez into a recognizable JSON Tiles ancestor without committing to storage changes. The decision points worth surfacing before phase 5 are (a) how reordering composes with notochord's subject-keying, and (b) whether to adopt JSON Tiles' own JSONB or an off-the-shelf binary JSON for the residual storage. Both are deferred-decision-friendly until phase 5/6.
+Phase 1 unblocks every later phase and validates the shape-language design against real input. Phase 2 turns shapez into a recognizable JSON Tiles ancestor without committing to storage changes. The decision points worth surfacing before phase 5 are (a) how reordering composes with the host system's partition keys, and (b) whether to adopt JSON Tiles' own JSONB or an off-the-shelf binary JSON for the residual storage on the column-store path (the variant-export path is governed by the Spark/Iceberg spec instead). Both are deferred-decision-friendly until phase 5/6.
