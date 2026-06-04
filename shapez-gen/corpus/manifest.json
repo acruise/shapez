@@ -1,27 +1,33 @@
 {
   "schemas": [
     {
-      "name": "atomic/scalar_root_int",
+      "name": "scalar_root_int",
+      "shows": "The boring case: a document is a bare integer. If this doesn't work, nothing else will.",
       "dimensions": ["scalar_root_int"]
     },
     {
-      "name": "atomic/record_stable",
+      "name": "record_stable",
+      "shows": "Still boring, also load-bearing: every document is the same four-field record with all fields required. The most ordinary case there is.",
       "dimensions": ["record_stable", "leaf_uuid", "leaf_email", "leaf_iso_timestamp"]
     },
     {
-      "name": "atomic/record_optional",
+      "name": "record_optional",
+      "shows": "One required field, three optional. The analyzer needs to mark fields nullable from per-doc presence, NOT spawn variant arms over the optional ones.",
       "dimensions": ["record_optional", "leaf_uuid", "leaf_url"]
     },
     {
-      "name": "atomic/map_uuid_keys",
+      "name": "map_uuid_keys",
+      "shows": "Keys are UUIDs — data, not metadata. The record-view drops, a wildcard gets injected, and the leaf shape under the wildcard is recovered by pooling. The whole point of the dual-view design.",
       "dimensions": ["map_uuid_keys"]
     },
     {
-      "name": "atomic/tuple_heterogeneous",
+      "name": "tuple_heterogeneous",
+      "shows": "Fixed-arity [string, f64, i64, bool] tuple. Tuple-vs-bag detection has to win on tight arity AND keep per-position type purity across mixed scalar types.",
       "dimensions": ["tuple_heterogeneous"]
     },
     {
-      "name": "atomic/polymorphic_array_discriminated",
+      "name": "polymorphic_array_discriminated",
+      "shows": "Each array element is one of three discriminated event shapes. The Space-Saving subtree cluster sketch has to surface all three as variant arms instead of collapsing them into one struct with everything optional.",
       "dimensions": ["polymorphic_array_discriminated", "discriminated_union_object", "leaf_uuid"]
     }
   ]

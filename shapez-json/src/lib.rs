@@ -11,6 +11,9 @@
 //!   path, where a violating document needs to be captured as a typed
 //!   value for downstream serialization.
 
+pub mod chaos;
+pub mod batch;
+
 use std::collections::BTreeMap;
 
 use meta_types::value::{MapKey, Value};

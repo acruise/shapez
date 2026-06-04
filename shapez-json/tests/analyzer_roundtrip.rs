@@ -36,7 +36,7 @@ fn analyze_schema(name: &str, count: usize, seed: u64) -> ShapeNode {
 
 #[test]
 fn scalar_root_int_infers_i64() {
-    let shape = analyze_schema("atomic/scalar_root_int", 1000, 1);
+    let shape = analyze_schema("scalar_root_int", 1000, 1);
     match &shape.kind {
         ShapeKind::Type(ValueType::I64) => (),
         other => panic!("expected I64, got {other:?}"),
@@ -46,7 +46,7 @@ fn scalar_root_int_infers_i64() {
 
 #[test]
 fn record_stable_infers_required_struct() {
-    let shape = analyze_schema("atomic/record_stable", 1000, 2);
+    let shape = analyze_schema("record_stable", 1000, 2);
     let fields = match &shape.kind {
         ShapeKind::Type(ValueType::Struct { fields }) => fields,
         other => panic!("expected Struct, got {other:?}"),
@@ -61,7 +61,7 @@ fn record_stable_infers_required_struct() {
 
 #[test]
 fn record_optional_marks_optional_fields_nullable() {
-    let shape = analyze_schema("atomic/record_optional", 1000, 3);
+    let shape = analyze_schema("record_optional", 1000, 3);
     let fields = match &shape.kind {
         ShapeKind::Type(ValueType::Struct { fields }) => fields,
         other => panic!("expected Struct, got {other:?}"),
@@ -76,7 +76,7 @@ fn record_optional_marks_optional_fields_nullable() {
 
 #[test]
 fn map_uuid_keys_infers_map() {
-    let shape = analyze_schema("atomic/map_uuid_keys", 1000, 4);
+    let shape = analyze_schema("map_uuid_keys", 1000, 4);
     let value_type = match &shape.kind {
         ShapeKind::Type(ValueType::Map { key_type, value_type, .. }) => {
             assert_eq!(**key_type, ValueType::String);
@@ -97,7 +97,7 @@ fn map_uuid_keys_infers_map() {
 
 #[test]
 fn tuple_heterogeneous_infers_mixed_tuple() {
-    let shape = analyze_schema("atomic/tuple_heterogeneous", 1000, 5);
+    let shape = analyze_schema("tuple_heterogeneous", 1000, 5);
     let positions = match &shape.kind {
         ShapeKind::Tuple { positions } => positions,
         other => panic!("expected Tuple, got {other:?}"),
@@ -117,10 +117,45 @@ fn tuple_heterogeneous_infers_mixed_tuple() {
 }
 
 #[test]
+fn map_uuid_keys_detect_uuid_format_on_keys() {
+    // Even though we don't keep individual map keys past the cap, the
+    // analyzer must record that every observed key matches the UUID
+    // syntactic format. This is the load-bearing case for the design:
+    // at high-cardinality positions the syntax distribution is valuable
+    // exactly because the values are not.
+    let corpus = shapez_gen::Corpus::load(corpus_path()).unwrap();
+    let entry_idx = corpus
+        .manifest()
+        .schemas
+        .iter()
+        .position(|e| e.name == "map_uuid_keys")
+        .unwrap();
+    let shape = &corpus.shapes()[entry_idx];
+
+    let mut rng = StdRng::seed_from_u64(123);
+    let mut analyzer = StreamingAnalyzer::new();
+    for ord in 0..1000 {
+        let value = shapez_gen::instantiate::instantiate(shape, &mut rng);
+        shapez_json::drive_document(&mut analyzer, ord, &value);
+    }
+    let report = analyzer.report();
+    assert!(
+        report.contains("UUID"),
+        "expected UUID format detection in report; got:\n{report}",
+    );
+    // The summary must call it out at >=90% confidence.
+    let summary = analyzer.summary();
+    assert!(
+        summary.contains("100% UUID") || summary.contains("UUID"),
+        "expected UUID format in summary; got:\n{summary}",
+    );
+}
+
+#[test]
 fn polymorphic_array_infers_variant_arms() {
     // With Space-Saving subtree clustering, the element should be a
     // Variant of three Record arms — one per discriminator value.
-    let shape = analyze_schema("atomic/polymorphic_array_discriminated", 1000, 6);
+    let shape = analyze_schema("polymorphic_array_discriminated", 1000, 6);
     let element = match &shape.kind {
         ShapeKind::Array { element, .. } => element.as_ref(),
         other => panic!("expected rich Array root, got {other:?}"),
