@@ -14,5 +14,8 @@ pub mod session;
 pub mod stats;
 
 pub use analyzer::{AnalyzerPolicy, StreamingAnalyzer};
-pub use batch::{analyze, AnalysisOutcome, BatchError, DocumentSource, TimePredicate};
+pub use batch::{
+    analyze, AnalysisOutcome, BatchError, DocumentSource, NaiveZonePolicy, TimeInterpreter,
+    TimePredicate, TimeRaw,
+};
 pub use ingest::{Analyzer, JsonEventSink};

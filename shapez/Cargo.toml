@@ -8,3 +8,5 @@ description = "Structural shape inference over streams of typed values"
 
 [dependencies]
 meta-types = { path = "../_meta/rust-types" }
+chrono.workspace = true
+dateparser.workspace = true

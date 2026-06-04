@@ -30,9 +30,10 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::ops::ControlFlow;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use serde::Deserialize;
-use shapez::batch::{BatchError, DocumentSource, TimePredicate};
+use shapez::batch::{BatchError, DocumentSource, TimeInterpreter, TimePredicate, TimeRaw};
 use shapez::path::{Path, PathStep};
 use shapez::StreamingAnalyzer;
 
@@ -121,6 +122,13 @@ pub struct FilesystemDir<D: RecordDecoder> {
     filter: Option<Box<dyn Fn(&std::path::Path) -> bool>>,
     time: TimePredicate,
     at: Option<Path>,
+    /// Per-record time extractor. When set, supersedes the file-mtime
+    /// check: each record is tested against `time` using the extracted
+    /// per-record timestamp instead of (or in addition to) the file's
+    /// modification time. Records whose extractor returns None are
+    /// excluded — operators who want different behavior wrap the
+    /// extractor accordingly.
+    time_extractor: Option<Box<dyn Fn(&serde_json::Value) -> Option<SystemTime>>>,
 }
 
 impl<D: RecordDecoder> FilesystemDir<D> {
@@ -131,6 +139,7 @@ impl<D: RecordDecoder> FilesystemDir<D> {
             filter: None,
             time: TimePredicate::default(),
             at: None,
+            time_extractor: None,
         }
     }
 
@@ -158,6 +167,24 @@ impl<D: RecordDecoder> FilesystemDir<D> {
         self.at = Some(path);
         self
     }
+
+    /// Install a per-record time extractor. When set, the predicate
+    /// from `.within(...)` is tested against each record's extracted
+    /// timestamp instead of the file's modification time — the
+    /// file-mtime check is skipped on the assumption that the
+    /// per-record signal is more accurate (file mtime can lag content
+    /// time arbitrarily).
+    ///
+    /// Records whose extractor returns None are excluded. Sources that
+    /// want different behavior (silent inclusion, surfacing a count of
+    /// skipped records, etc.) wrap the extractor accordingly.
+    pub fn with_time_extractor(
+        mut self,
+        f: impl Fn(&serde_json::Value) -> Option<SystemTime> + 'static,
+    ) -> Self {
+        self.time_extractor = Some(Box::new(f));
+        self
+    }
 }
 
 impl<D: RecordDecoder> DocumentSource for FilesystemDir<D> {
@@ -171,7 +198,12 @@ impl<D: RecordDecoder> DocumentSource for FilesystemDir<D> {
             Some(p) => format!(" at={p}"),
             None => String::new(),
         };
-        format!("{}:{}{filt}{time}{at}", self.decoder.label(), self.root.display())
+        let tx = if self.time_extractor.is_some() { " per-record-ts" } else { "" };
+        format!(
+            "{}:{}{filt}{time}{tx}{at}",
+            self.decoder.label(),
+            self.root.display(),
+        )
     }
 
     fn drive(self, sink: &mut StreamingAnalyzer) -> Result<u64, BatchError> {
@@ -179,13 +211,17 @@ impl<D: RecordDecoder> DocumentSource for FilesystemDir<D> {
         walk(&self.root, &mut files)?;
         files.sort();
         let mut ordinal: u64 = 0;
+        let has_predicate = self.time.start.is_some() || self.time.end.is_some();
+        let has_extractor = self.time_extractor.is_some();
         'files: for path in &files {
             if let Some(f) = &self.filter {
                 if !f(path) {
                     continue;
                 }
             }
-            if self.time.start.is_some() || self.time.end.is_some() {
+            // File-mtime filter only when no per-record extractor is in
+            // play. The extractor is the more accurate signal when set.
+            if has_predicate && !has_extractor {
                 let mtime = fs::metadata(path)?.modified()?;
                 if !self.time.contains(mtime) {
                     continue;
@@ -193,7 +229,20 @@ impl<D: RecordDecoder> DocumentSource for FilesystemDir<D> {
             }
             let file = File::open(path)?;
             let at = self.at.as_ref();
+            let extractor = self.time_extractor.as_ref();
+            let predicate = &self.time;
             self.decoder.decode(file, |value| {
+                // Per-record time check, against the full decoded
+                // document (the time field commonly lives in the
+                // envelope, outside `.at` projection).
+                if let Some(ex) = extractor {
+                    if has_predicate {
+                        match ex(value) {
+                            Some(t) if predicate.contains(t) => {}
+                            _ => return ControlFlow::Continue(()),
+                        }
+                    }
+                }
                 let target = match at {
                     Some(p) => match navigate(value, p) {
                         Some(v) => v,
@@ -272,6 +321,27 @@ impl JsonlDir {
 
     pub fn at(self, path: Path) -> Self {
         Self(self.0.at(path))
+    }
+
+    /// Pull the per-record timestamp from `path` and lift it through
+    /// `interpreter`. Path is resolved against the FULL decoded value
+    /// (not the `.at` projection), so the timestamp can live in the
+    /// envelope outside the analyzed subtree.
+    pub fn with_time_field(self, path: Path, interpreter: TimeInterpreter) -> Self {
+        Self(self.0.with_time_extractor(move |value| {
+            let raw = navigate(value, &path)?;
+            match raw {
+                serde_json::Value::Number(n) => {
+                    let i = n.as_i64().or_else(|| {
+                        n.as_u64()
+                            .and_then(|u| if u <= i64::MAX as u64 { Some(u as i64) } else { None })
+                    })?;
+                    interpreter.interpret(TimeRaw::Int(i))
+                }
+                serde_json::Value::String(s) => interpreter.interpret(TimeRaw::Str(s)),
+                _ => None,
+            }
+        }))
     }
 }
 
@@ -428,6 +498,103 @@ mod tests {
         assert_eq!(outcome.policy.reason, policy.reason);
         assert!(outcome.source.starts_with("jsonl:"));
         assert!(outcome.bailed.is_none(), "natural completion should not flag bail");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn with_time_field_filters_records_by_epoch_millis() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let tmp = std::env::temp_dir().join("shapez_batch_test_time_field_ms");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // 1700_000_000_000 ms = 2023-11-14
+        // 1800_000_000_000 ms = 2027-01-15
+        // 1900_000_000_000 ms = 2030-03-17
+        write_jsonl(
+            &tmp,
+            "events.jsonl",
+            &[
+                r#"{"ts":1700000000000,"payload":"early"}"#,
+                r#"{"ts":1800000000000,"payload":"middle"}"#,
+                r#"{"ts":1900000000000,"payload":"late"}"#,
+            ],
+        );
+        let predicate = TimePredicate {
+            start: Some(UNIX_EPOCH + Duration::from_secs(1_750_000_000)),
+            end: Some(UNIX_EPOCH + Duration::from_secs(1_850_000_000)),
+        };
+        let path: Path = ".ts".parse().unwrap();
+        let outcome = analyze(
+            JsonlDir::new(&tmp).within(predicate).with_time_field(path, TimeInterpreter::EpochMillis),
+            AnalyzerPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.doc_count, 1, "only the middle record falls in the window");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn with_time_field_filters_records_by_iso8601_string() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let tmp = std::env::temp_dir().join("shapez_batch_test_time_field_iso");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        write_jsonl(
+            &tmp,
+            "log.jsonl",
+            &[
+                r#"{"at":"2024-01-01T00:00:00Z","msg":"old"}"#,
+                r#"{"at":"2024-06-15T12:00:00Z","msg":"window"}"#,
+                r#"{"at":"2024-12-31T23:59:59Z","msg":"future"}"#,
+            ],
+        );
+        let predicate = TimePredicate {
+            start: Some(UNIX_EPOCH + Duration::from_secs(1_710_000_000)), // ~2024-03
+            end: Some(UNIX_EPOCH + Duration::from_secs(1_730_000_000)),   // ~2024-10
+        };
+        let path: Path = ".at".parse().unwrap();
+        let outcome = analyze(
+            JsonlDir::new(&tmp).within(predicate).with_time_field(path, TimeInterpreter::StringTimestamp(shapez::NaiveZonePolicy::Refuse)),
+            AnalyzerPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.doc_count, 1, "only the middle log line is in the window");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn with_time_field_skips_file_mtime_check() {
+        // The file was just written, so its mtime is "now". A predicate
+        // entirely in the past would exclude the file under file-mtime
+        // semantics — but `with_time_field` makes the per-record
+        // timestamp the authority, so records in the past pass.
+        use std::time::{Duration, UNIX_EPOCH};
+        let tmp = std::env::temp_dir().join("shapez_batch_test_time_field_skip_mtime");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        write_jsonl(
+            &tmp,
+            "old.jsonl",
+            &[
+                r#"{"ts":1700000000,"v":1}"#,
+                r#"{"ts":1700001000,"v":2}"#,
+                r#"{"ts":1700002000,"v":3}"#,
+            ],
+        );
+        // 2023-11-14 window, before this test runs.
+        let predicate = TimePredicate {
+            start: Some(UNIX_EPOCH + Duration::from_secs(1_699_999_999)),
+            end: Some(UNIX_EPOCH + Duration::from_secs(1_700_003_000)),
+        };
+        let path: Path = ".ts".parse().unwrap();
+        let outcome = analyze(
+            JsonlDir::new(&tmp)
+                .within(predicate)
+                .with_time_field(path, TimeInterpreter::EpochSeconds),
+            AnalyzerPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.doc_count, 3, "all three records fall in the window");
         let _ = fs::remove_dir_all(&tmp);
     }
 

@@ -162,6 +162,34 @@ shapez has two operating modes, sharing the analyzer:
 - Operator-triggered re-analysis: same data, different policy. Higher sample rate, larger record_view cap, a new format detector. Operators often call this *retraining*; mechanically it's just another batch run with `policy.reason` populated for the audit log.
 - Ad-hoc investigations: scoped slice + tight policy + concrete answer.
 
+A property of batch mode worth calling out explicitly: **it makes design iteration cheap.** Streaming pipelines force caution about every change because production is on the same code path; batch lets you sit down, try five dumb things in ten minutes, pick whichever one is less dumb, and keep iterating. The cost of being wrong is *"wasted ten minutes"* instead of *"broke the live pipeline."*
+
+Put differently: **the distinguishing property isn't speed but control.** Streaming is reactive — events arrive at their own cadence, the rhythm is set by the data feed, and you live with the hurry-up-and-wait that follows. Batch is imperative — the caller says *"go analyze this,"* the analyzer does it, the caller decides what to ask next.
+
+Both volume and tempo turn out to be orthogonal to the distinction: batch can absolutely chew through a petabyte in minutes (nobody calls that slow), and streams can be infinite-in-principle but trivially sparse in practice (a heartbeat event per hour, a single error log line per day — the events come when they come). Likewise batches can be a single record handed to `analyze` from a test fixture. The axis that actually defines the choice is **who initiates each unit of work** — the data source for streaming, the caller for batch — and that's independent of how much data flows and how fast. Design work needs that initiative on the caller's side: the decision-maker (operator at a terminal, tournament-scoring function picking among candidates, LLM agent doing design iteration) sets the rhythm, not the data feed. You can't iterate against a feed whose tempo is dictated by a Kafka producer somewhere; you can iterate against something you've captured and can interrogate repeatedly at whatever cadence the decision-maker prefers.
+
+The committed `samples/` corpus plus the `samples_regression.rs` invariants exist for exactly this reason — load-bearing decisions (record-vs-map thresholds, cluster cap, sample rate floor, format detector ordering) get iterated against a fixed fixture and decided by reading the diff, not argued about from first principles. The hypothesis is wrong far more often than first-principles reasoning suggests, and the fixture is patient. Every committed analyzer-behavior change in this repo so far has run through that loop at least once; the convention is worth preserving.
+
+A related operational property: **when streaming is already running and you want a different policy, the answer often isn't to redeploy.** Cross your fingers and wait until the streaming pipeline saturates — let the sketches converge under the existing policy, accept that they're producing a coarse-but-real answer, then run batch analysis against the accumulated tile state with the new policy whenever a refined view is worth the cycles. The batch pass produces the new artifacts (`ShapeNode` tree, `PromotionPlan`, compiled matcher); the streaming pipeline keeps doing its old job, which is fine because what it's producing isn't *wrong*, just less precise than the new policy could make it. The analytical policy decision gets decoupled from the streaming deployment decision — operators can change their mind about analysis without touching the live ingest path. That asymmetry is what production operators want and what most schema-inference tooling doesn't offer.
+
+A third operational property, this one on the streaming side: **nothing prevents running multiple parallel analyzers on the same production stream**, each with different match criteria, different target fields, different policy coefficients. The `JsonEventSink` trait broadcasts events; every analyzer in a fan-out receives the same input independently, maintains its own state, produces its own output, contends for nothing. Shadow analyzers run experimental policies alongside the primary (output goes to a diff display rather than production storage, until a shadow earns promotion). Targeted analyzers each focus on a different `.at()` projection of the same events — one looking at `.events.user_actions`, another at `.events.system_metrics`, another at the envelope. Differential sensitivity testing spins up N copies with varied caps to see how much the inferred shape actually depends on those choices. Per-analyzer cost stacks linearly with N, but each instance is already cheap by design (sampling, bounded sketches), and *"are these two policies meaningfully different?"* answered by an hour of parallel real traffic beats a coordinated deploy-then-observe cycle every time. The fan-out pattern is what the event-vocabulary input contract was designed to support, even if we only call it out once we have enough policy machinery to make the parallel configurations meaningfully distinct.
+
+### Tournament-style policy lifecycle (TODO)
+
+A recurring pattern in this project's headcanon, connected to the JSON Tiles ancestry: **keep the boring stuff running, spin up the neat ideas, promote them to boring if they turn out to be good or let them die if they can't compete.** Three tiers of analyzer policy coexist:
+
+- **Boring (production)**: the policy driving `PromotionPlan` output, emitting the active Quamina matcher, appearing in audit logs as the *"this is what we believe about the data"* answer. Conservative, well-understood, slow to change.
+- **Spinning up (experimental)**: candidate policies — new format detector, bigger cluster cap, tweaked sample rate, alternative time-extractor — running as shadow analyzers (parallel against the live stream) and/or back-tested against the `samples/` corpus and accumulated tile state. Output goes to a comparison surface, never directly to production storage.
+- **Retired**: experimental policies whose results couldn't justify the change, or former-boring policies that got outperformed by a challenger. Kept around for audit and historical reproducibility; never running.
+
+The three operational properties named above are exactly the mechanism: streaming fan-out runs shadows on real traffic; batch on `samples/` produces controlled comparisons; deployment-decoupling means the boring stays put through the entire evaluation. **Promotion is a config change, not a code change.**
+
+The promotion criterion is the interesting design question — *coverage* (more of the long tail classified into named categories), *compression* (more bytes shredded into typed columns, less in the residual), *stability* (less churn across re-analyses with varied seeds), *resource cost* (CPU per record, weighted as a constraint rather than a free dimension). Scoring is operator policy; shapez produces the inputs and trusts the host to combine them per deployment.
+
+**This is analogous to back-testing in quant finance**, and the parallels are exact enough to be worth naming: candidate strategies (policies) are back-tested against historical data (`samples/`, accumulated tile state) and forward-tested via paper-trade mode (shadow analyzers on live traffic) before being promoted to live trading (the boring tier). Strategy retirement is the symmetric move when an old policy gets outperformed. The discipline quant teams have built around tournament-style strategy management is directly applicable here — performance attribution (*why* did the new policy win on this slice?), regime detection (*the boring is fine for steady state but a recent challenger handles the burst case better*), even alpha decay (*the once-clever format detector is now part of the boring baseline and no longer differentiates*). The *"never just one strategy in production"* mindset is exactly what makes the three operational properties above worth having.
+
+Not built yet; flagged here because this is the natural endgame for the operational design, and the right shape for the eventual policy-registry, promotion-criterion-API, and tournament-scoring surface. None of the pieces are exotic in isolation — config registry, shadow output capture, scoring functions — but the discipline of treating analyzer policies as a portfolio worth managing rather than a single deployment decision is what makes the whole machine *actually* keep learning.
+
 The rest of this section is batch specifics — sources, time predicates, policy provenance, bailout. The streaming path is unchanged across all of it; both modes share the analyzer and its policy, and a batch run is just "a streaming run over a bounded source that calls `finish()` at the end."
 
 ### Sources and the `DocumentSource` trait
@@ -196,6 +224,66 @@ Two cross-cutting concerns surface as soon as sources stop being plain JSON file
 Every `DocumentSource` exposes `.at(path: shapez::path::Path)` for this. The path uses shapez's existing `Path` syntax (`.payload`, `.event.data`, `.items[0]`). At drive time, the source decodes the message, walks into the subtree, and feeds *that* to the analyzer. Documents whose path doesn't resolve are silently skipped — there's no value in feeding the analyzer documents that don't have the structure we're investigating.
 
 The `.at()` builder is uniform across sources; the implementation belongs on each source because it composes with the source's own decode step. The audit trail (`AnalysisOutcome.source`) includes the path so a replay knows where to look.
+
+### Path expression DSLs (TODO)
+
+Several API slots take a path expression — `.at(path)` for sub-document projection, `.with_time_field(path, parser)` for time extraction, future similar slots for assertion targets and promotion-plan addressing. shapez has its own `Path` DSL (`shapez::path::Path`) used internally for `PathPattern` matching: small, ASCII, wildcard-aware (`.flags.*.enabled`), already round-tripping cleanly between `Display` and `FromStr`. It's the canonical wire-level type and stays that way.
+
+The dialect is also unfamiliar. Operators who don't read shapez's docs first won't know that `.flags.*.enabled` is the canonical form, and there's no reason they should — there's an industry-standard path language for JSON-shaped data already, and it's called **JSONPath**.
+
+The plan:
+
+- **Accept both as input.** Operator-facing builders (`.at`, `.with_time_field`, future assertion locators) take an `impl Into<Path>` or an `impl TryInto<Path>` and parse either shapez native (`.event.data`) or JSONPath (`$.event.data`) into the same internal `Path`. The dialect is autodetected from the first character (`.` vs `$`), or the operator picks explicitly via separate constructors.
+- **Stay native for output.** Reports, audit strings, and the inferred `PathPattern` always render in shapez's DSL — that's what the rest of the system uses, and we shouldn't pretend the input syntax is the wire format. If the operator supplied JSONPath, the audit trail records both forms so a replay reproduces what they typed and the system reasons about what they meant.
+- **Constrained JSONPath subset.** JSONPath has features (filters `[?(@.x > 5)]`, recursive descent `..`, slicing `[1:5]`, unions `[a,b]`) that don't map to a single-location selector. v1 accepts only the parts that round-trip to a `Path`: dotted field access, bracket field access (`['foo bar']` for quoted names), array indexing (`[0]`), and the root marker (`$`). Wildcards (`*`) get parsed to shapez's `AnyField` / `AnyIndex` so `PathPattern` round-tripping works. Anything richer than that raises a parse error — better a clear "we don't support filters yet" than a half-implementation that silently does the wrong thing.
+
+The cost is small — one parser per dialect, both targeting the same AST — and the value is large: an operator who already knows JSONPath can be productive without first learning that shapez's paths start with `.` and not `$`. The path DSL is the user-facing surface; the internal `Path` is the wire-level type. Two dialects feeding one representation is the right shape.
+
+### Multi-path automaton traversal (TODO)
+
+A natural generalization once we have several path-shaped slots evaluating against the same record — `.at()` projection, `.with_time_field()` extraction, planned assertion targets, planned `FromSiblingField` policy lookups, planned promotion-plan addresses — is to *compile them all into a single multi-path automaton* and drive them in a single traversal of the input.
+
+The shape:
+
+- Each `Path` / `PathPattern` compiles to its own NFA, with states for each step (`Field`, `Index`, `AnyField`, `AnyIndex`).
+- The N automata advance in lockstep over the event stream or DOM traversal — at each event, every still-live automaton either takes a transition (the event matched its current expected step), stays in its current state, or fails.
+- When an automaton reaches its accepting state, the bound callback fires with the matched value.
+- When an automaton fails its next transition, **the per-expression config decides what happens**:
+  - **Precondition**: the whole traversal aborts. The record is rejected — *"this required path didn't resolve, the record fails its prerequisites."* `.at()` and required `.with_time_field()` both behave this way today: a record where `.payload` doesn't exist is silently skipped.
+  - **Prune**: just that expression drops out; the other automata continue. `FromSiblingField`'s tz hint, optional assertion targets, and any "if you can find this, use it" policy belong here.
+
+This is the classical streaming-XPath / streaming-JSONPath compiled-query-plan technique (Yfilter, XPush, twig-pattern matching from the early-2000s XML literature) applied to shapez's specific set of address slots. It composes naturally with both architectural choices from the *materialize vs reorder* discussion below: run the unified automaton over a materialized DOM in a single visit, or use the automaton's per-step demand to tell an event-driven parser which events to deliver next.
+
+**Read the production-scale precedents before reinventing.** AWS's [`event-ruler`](https://github.com/aws/event-ruler) (Java) is the canonical industrial system — used internally at AWS for years (CloudWatch Events / EventBridge) before open-sourcing, designed to match millions of incoming events per second against millions of registered patterns. Tim Bray's [`quamina`](https://github.com/timbray/quamina) (Go) is the successor in spirit, smaller scope, current and active, and probably the easiest entry point for understanding the technique. Both compile N JSON-shaped patterns into a single NFA, both handle wildcards and prefix matches cleanly, and both have already worked through the engineering questions (state explosion, pattern addition/removal at runtime, observability under high cardinality) that we'd otherwise rediscover the hard way. Neither is a drop-in for shapez — they're event-routers, not analyzer-driver compilers, and the precondition-vs-prune semantics aren't quite the same as their "did any rule match" output — but the data structures and the production knowledge they encode are exactly what an in-tree implementation should crib from.
+
+Implementation notes for whoever picks this up:
+
+- The shapez `Path` and `PathPattern` types already give us the AST; the missing pieces are the compile-to-NFA step and the multi-automaton driver. Wildcards (`AnyField`, `AnyIndex`) push the cumulative state set into proper N-ary territory, but in practice the branching is bounded by the actual record shape.
+- The precondition / prune flag is per-expression, not per-source. Two policies on the same source can have different behaviors when their path doesn't resolve, and the operator picks at the slot where the path is named.
+- The right place to surface the distinction in user-facing config is alongside the path itself — `.at(path).required()` vs `.at(path).optional()`, or an explicit `OnMissing::{Skip, Prune}` enum hung off each path-taking builder.
+
+Not built yet; the case for it gets stronger as more path-shaped slots show up. With one or two, independent walks are cheap. With four or five, a unified driver starts to matter — for correctness as much as throughput, because *"did this record satisfy every required precondition"* is best answered by a single decision point rather than scattered across per-slot checks that might evaluate in different orders.
+
+### Compiling inferred categories to Quamina matchers (TODO)
+
+A complementary integration path between shapez and Quamina worth naming: once an analysis run reaches high confidence that the categories it sees are stable — cluster sketches not churning, variant arms holding their distribution, format detectors not flipping — the categories shapez identified can be **compiled into Quamina patterns and handed off** for real-time classification. shapez is slow and thorough; Quamina is fast and deterministic; the compile step is the bridge.
+
+The pipeline:
+
+1. **Analyze.** Run shapez over a representative sample until confidence is high enough — bounded eviction rate, stable variant-arm distributions, format detectors not flipping. The natural snapshot point is an epoch boundary; the dictionary is frozen there by design.
+2. **Annotate, optionally human-in-the-loop.** shapez sees structural categories — *"variant arm at `.event` whose record signature is `{type=purchase, order:{...}}`"* — but their *meaning* is operational. The operator (UI, annotation file, workflow tool) names each one: `purchase_event`, `view_event`, `system_metric`, `auth_failure`. Names are the bridge from structural shape to semantic category — the *one person's syntax, another's semantics* tenet doing its job at the human/machine boundary. shapez can autogenerate placeholder names (`category_001`, `arm_3`) so the unannotated pipeline still runs.
+3. **Compile.** Each named category becomes a Quamina pattern. The compilation is mechanical for the common cases: shapez's per-category structural signature (cluster `Sig`, variant arm, discriminator field value) maps to Quamina's JSON pattern language. Field-existence, value-equality, prefix-match all fall out naturally; numeric ranges and the more sophisticated predicates compose too. The output is a Quamina program — *the "black box"* — that takes an event in and returns the set of matching category names.
+4. **Deploy.** The Quamina matcher is a frozen artifact, pinned to a specific shapez analysis run. Reproducible by construction (the policy provenance work from the wire-contracts discussion); fast in production because matching is NFA traversal, no sketches, no per-event learning.
+5. **Detect drift.** Events that fail to match any category are a first-class signal: the live distribution has moved away from the analyzed one. Counting them is cheap; surfacing the count and a reservoir sample of unmatched events is exactly the prompt to trigger a re-analysis. The feedback loop closes — shapez analyzes, compiles to Quamina, Quamina classifies, unmatched count surfaces, shapez re-analyzes.
+
+Where categories come from is the interesting design question:
+
+- **Cluster arms**: each entry in a position's Space-Saving top-K *is* a category by construction. The signature gives the pattern; the operator gives the name.
+- **`ShapeKind::Variant { arms }`** in the inferred shape tree: any variant decision is a partition of the value space; each arm is a candidate category.
+- **Discriminated records**: when a record has a const-like field (`type = "purchase"`, `kind = "click"`) that visibly splits the structure, the discriminator value is the category name straight out of the data, no human annotation required.
+- **Per-field format families**: a string field where 95% match UUID + 5% match email is two categories at that path; operators routinely want to route those separately.
+
+This is one of the more natural ways shapez's analytical output becomes operational. `PromotionPlan` goes to storage layers; a compiled matcher goes to routing, classification, alerting, billing tagging — anywhere a downstream system wants *"given this event, what is it?"* answered at production speed without re-running analysis. The compiled-matcher artifact deserves its own stable serialization (same case as `AnalysisOutcome` and `PromotionPlan`); Quamina's pattern language is JSON, so what we emit should round-trip cleanly through it — checked into a config repo, diffed across re-analyses, code-reviewed, rolled back like any other deployed artifact.
 
 ### Beyond JSON: any machine-readable syntax
 
@@ -259,9 +347,99 @@ Run scope is rarely "every byte ever stored." Operators want windows — "the la
    - **Regex on raw bytes**: log lines where the timestamp is text at a known prefix position. The adapter declares the pattern and capture group.
 2. **Parsing / interpretation** — how to lift the raw extracted value into a `SystemTime`. This is data-specific, not source-specific, and the same parser usually applies across many sources:
    - **Epoch integers**: `epoch_seconds` / `epoch_millis` / `epoch_micros` / `epoch_nanos`. The same windows `NumericStats::epoch_guess` uses to *detect* an epoch field at analysis time are the parsers an operator would name to *consume* one.
-   - **ISO-8601 strings**: the `StringFormat::IsoTimestamp` detector's permissive variants (with `T` or space separator, optional fractional seconds, optional Z / offset) — same logic running in reverse.
+   - **String timestamps**: a permissive parser via the `dateparser` crate. Covers ISO 8601 / RFC 3339, RFC 2822, US-style `M/D/Y`, numeric epoch as string, common log formats. Strings without a zone marker route through `NaiveZonePolicy` (Refuse by default; operators override per field with `AssumeUtc`, `AssumeFixedOffset { seconds }`, or `Local`).
    - **Native typed**: no parsing needed when the source delivers an already-typed timestamp (Parquet column, SQL column with the right type).
    - **Custom format strings**: `strftime`-shaped patterns for the long tail of bespoke timestamps. Operator-supplied.
+   - **UUIDv7 and ULID**: both encode a 48-bit epoch-millis timestamp in their leading bits — UUIDv7 in the first 12 hex chars (RFC 9562, version nibble validated), ULID in the first 10 Crockford Base32 chars (lexicographic ordering by time). Each gets its own `TimeInterpreter` variant because the pattern is common: primary-key columns in modern systems frequently *are* timestamps with random cruft attached, and writing an envelope `created_at` field next to the ID is a workaround for tooling that didn't realize it could extract the timestamp from the ID itself. Saying so once at the analyzer level beats every consumer rolling its own bit-twiddle.
+
+`dateparser` is the cold path. A natural refinement — not built yet, flagged here — is to do what the analyzer does everywhere else: sample, infer, commit. For the first N records of a field, run the full fuzzy ladder and tally which formats matched. Once one or two dominate, pin a fast `chrono::DateTime::parse_from_str` with the winning format string and parse the rest at roughly 1/N the cost. Fall back to the ladder if the pinned parser starts missing. The fit between dateparser and our throughput goals isn't as close as just calling it for every record makes it look; it's the right tool for warmup, not the steady state.
+
+### Per-field interpretation policy (TODO)
+
+The `TimeInterpreter` enum names *how* to parse but not *what to do when the parse is ambiguous*. Real timestamp pipelines need a small policy slot for questions the parser alone can't answer:
+
+- **Naive-zone fallback** — *built*. `NaiveZonePolicy` carries the per-field choice: `Refuse` (default — reject zoneless strings, the design preference because silently picking any zone for data that didn't name one is a correctness hazard), `AssumeUtc`, `AssumeFixedOffset { seconds }`, or `Local` (dateparser's host-clock fallback, available for compat but almost always wrong). Planned variants on the same enum: `AssumeNamed(String)` for IANA zones (needs `chrono-tz`), `StickyPrevious { fallback }` for "use the offset of the most recent zoned record" (stateful), and `FromSiblingField { path, interpreter }` for the very common `{"ts": "...", "tz": "America/Los_Angeles"}` and `{"ts": "...", "utc_offset_min": -480}` patterns (needs interpret's contract widened so the policy sees the surrounding record, not just the extracted value). Whether also to track and surface a per-field count of zoneless observations is open — useful as audit even when the policy is `Refuse`, since the count tells the operator how many records the policy actually filtered out.
+- **Parse-failure handling.** Silent skip (current), count and surface in `AnalysisOutcome`, abort the whole run if more than X% fail, retry under a different interpreter. Each is right for a different deployment. Not built yet.
+- **Resolution-drift detection.** If a field is supposed to be epoch-millis but some records arrive in seconds (off by 1000× — common when two upstream services disagree), the parser silently gives nonsense. A policy bit that pins the expected magnitude would catch it. Not built yet.
+- **Locale hints.** US (`M/D/Y`) vs EU (`D/M/Y`) date order is genuinely ambiguous for "01/02/2024." Operators usually know which one their data uses; the policy slot is the place to tell us. Not built yet.
+
+The natural home is a small struct hung off `TimeInterpreter` or off the per-field configuration that names it — something like:
+
+```rust
+TimeInterpreter::StringTimestamp(InterpretationPolicy {
+    naive_zone: Some(NaiveZonePolicy::AssumeUtc),
+    on_parse_failure: ParseFailurePolicy::CountAndSurface,
+    locale_hint: Some(Locale::US),
+    ..Default::default()
+})
+```
+
+Or a small DSL — `"naive_zone=UTC; on_failure=count; locale=US"` — when the config is operator-typed rather than code-defined. Both shapes work; the right one depends on whether these policies usually come from code or from a config file.
+
+None of this is shapez-specific — every system that parses timestamps from semi-structured data faces the same four questions. The eventual home for the policy struct is therefore not `shapez::batch` but `_meta` (alongside `ValueType::Timestamp`), so downstream storage layers, the planned Avro / Parquet / Kafka adapters, and any other consumer of the shared type set can share the policy vocabulary. shapez references it; shapez doesn't own it. `NaiveZonePolicy` lives in `shapez::batch` for now as the first concrete slice; the migration to `_meta` happens when at least one other consumer would also use it.
+
+#### Architecture choice for context-aware policies: materialize vs reorder
+
+Making the surrounding record available to a policy is the load-bearing implementation cost for `FromSiblingField`, `StickyPrevious`, and any future context-aware policy. There are two paths with very different consequences:
+
+**Materialize the record.** Hold the whole decoded record (as `serde_json::Value`, or equivalent in-memory tree) while interpreting any field. Policies navigate freely. This is what `shapez-json`'s `drive_document` already does — we receive a fully-materialized Value, walk it into the analyzer one event at a time, and the Value lives for the duration of one record. For JSON sources we're paying this cost already; for SQL and Parquet sources the underlying client materializes rows itself. The simple path. Two factors take most of the sting out of this option:
+
+- *Sampling*: once the BTRBlocks-style sample-rate work lands, full materialization runs on only ~5% of documents. The other 95% pay a counter bump. The materialization cost is multiplied by 0.05 across the steady-state ingest path.
+- *simd-json has a DOM-shape mode*: the planned `shapez-simdjson` adapter can produce a tree representation (`simdjson::dom::element`) that's several times faster than `serde_json::Value` to parse and walk. Materializing isn't the same word in both libraries.
+
+**Static analysis + reordered event-driven parsing.** At policy configuration time, collect the set of paths every active policy depends on. At ingest time, the parser peeks ahead within a record to deliver the context-required fields first, then proceeds with the rest. The interpretation still happens at the right field (the timestamp), but with the cross-field context already in hand. This is the spicier path: it scales to records that don't fit in memory at all, supports pure event-stream sources that have no natural DOM (Avro container files, Protobuf streams), and avoids the tree-allocation cost entirely for sources that natively emit events.
+
+The two are not mutually exclusive — Value-shaped sources can materialize while event-shaped sources use static-analysis-driven reordering, both delivering the same `(record_context, raw_value) → SystemTime` contract upstream of the policy. *Default expectation*: materialize for the JSON adapter (free given the existing Value plumbing), materialize-via-simd-json-DOM for the simdjson adapter (still cheap because of the DOM-mode speed, doubly cheap because of sampling), and reorder only for the genuinely event-shaped sources where no DOM form exists. The "spicier" path is the right design when there's no tree to begin with — not the universal answer.
+
+### Cross-type timestamp tracking (TODO)
+
+The analyzer currently surfaces timestamp signal through two independent trackers that never talk to each other:
+
+- **`StringFormat::IsoTimestamp`** on per-string-leaf observations: detects strings that match the ISO 8601 / RFC 3339 family.
+- **`NumericStats::epoch_guess()`** on per-numeric-leaf observations: flags integer fields whose min/max sits inside one of the canonical epoch windows (seconds, millis, micros, nanos).
+
+Both produce evidence for the same conceptual thing — "this position holds timestamps" — but they live in different stats trackers and the signal isn't aggregated. The pathological case that escapes both is the epoch-shaped string: a varchar column containing `"1705314600"`. The string format detector doesn't match a known format (closest is `AllDigits`), the numeric detector never sees the value because it isn't a number, and the most we surface is a `_punct` skeleton like `9` (a 10-digit run) which is *suggestive* of a Unix-epoch field but doesn't actually claim so. Reality is full of varchar columns holding epoch numbers; we should not let them slip past.
+
+The future move is a `TimestampStats` tracker that aggregates evidence from any path that could produce a timestamp:
+
+- ISO-format string matches at this position (current `StringFormat::IsoTimestamp` signal).
+- Numeric values in any of the four epoch magnitude windows (current `NumericStats::epoch_guess` signal).
+- *String* values whose digit count and magnitude land in an epoch window — the epoch-as-string case the existing trackers miss.
+- The resolution distribution observed (seconds / millis / micros / nanos / *mixed*), which catches the "two upstream services disagree" failure named in the per-field policy section above.
+- The source-type distribution (came in as `i64`, came in as `string`, came in as `f64` with non-zero fractional part). Useful for shredding advice: a column that's 95% i64 and 5% string-of-digits wants a typed promotion plus a residual.
+- A percentile sketch (DDSketch over the resolved `SystemTime` values), so the report can surface "p50 was Tuesday afternoon, p99 was last August" — useful both as a sanity check and as a window predicate hint.
+- Naive-vs-zoned breakdown for string sources, since the per-field interpretation policy needs the count to decide its defaults.
+
+The reason to keep the existing string and numeric stats as-is, and add `TimestampStats` *on top*, rather than refactoring detection into one place: most strings aren't timestamps and most numbers aren't either; the existing per-type trackers do a lot of other work (format families, length sketches, sign breakdowns, range hints). The new tracker is a specialist that fires only when at least one detector at the position has flagged "timestamp-shaped," and then accumulates the cross-type evidence.
+
+Connection to the interpretation-policy TODO: stats and policy are complements. `TimestampStats` characterizes what the field is doing; `InterpretationPolicy` says what to do about it. Both want their eventual canonical home in `_meta`, not shapez.
+
+#### Boundary conditions on epoch-precision detection
+
+The current `NumericStats::epoch_guess()` uses four magnitude windows separated by ~3 orders of magnitude each, chosen conservatively so a value lands in at most one window. The gaps are not free — they're places where epoch values *are* timestamps but our classifier won't say so, or where adjacent precisions risk being confused. Worth enumerating before the cross-type tracker tries to do better:
+
+| Window | Range (`min` ≤ … ≤ `max`) | Approx. date coverage |
+|---|---|---|
+| `EpochSeconds` | 9e8 to 3e9 | 2001-09 to 2065-01 |
+| `EpochMillis` | 9e11 to 3e12 | 2001-09 to 2065-01 |
+| `EpochMicros` | 9e14 to 3e15 | 2001-09 to 2065-01 |
+| `EpochNanos` | 9e17 to 3e18 | 2001-09 to 2065-01 |
+
+**1. Inter-window dead zones** — values between 3e9 and 9e11 (and the equivalent gaps between micros and nanos) are *unclassified*. A millisecond timestamp from early 1970 (e.g., 1970-01-21 ≈ 1.8e9 ms) lands in this dead zone and is silently missed. Same for any value between 3e12 and 9e14, etc. These are 3-order-of-magnitude blind spots, deliberately so to prevent collision, but they exclude real timestamps from the late-`epoch` era.
+
+**2. Cross-window false positives at the extremes** — a 2024-era epoch-seconds value is ~1.7e9 (safely in window). But a far-future epoch-seconds value, say year 3000 (≈ 3.25e10), crosses out of the seconds window and lands in… nowhere (it's in the dead zone). Meanwhile a *micros* value from 1970-01-12 (≈ 1e12) would land in the millis window and be misclassified as a 2001 millis timestamp. The window edges are where adjacent-precision confusion happens, not the middles.
+
+**3. Off-by-1000 in a single mixed field** — the canonical "two upstream services disagree" case: API v1 sends `current_time_seconds` and v2 sends `current_time_millis` to the same column. Range becomes `[~1.7e9, ~1.7e12]` — spanning two windows. The current classifier requires `min ≥ LO ∧ max ≤ HI` within one window and silently returns `None`. The field becomes undetected even though *every individual record* is a valid timestamp. This is the case `TimestampStats`'s **resolution distribution** is designed to catch: aggregate per-record-precision-guesses and surface "67% look like seconds, 33% look like millis."
+
+**4. Non-timestamps that land in epoch windows** — Twitter-style snowflake IDs in 2024 are ~1.7e18, which sits *inside* the `EpochNanos` window and would currently be misidentified as 2024 nanosecond timestamps. Sequential database IDs at high-traffic services can pass 1e9 (epoch-seconds) and 1e12 (epoch-millis). The defense is corroborating evidence: a true timestamp field's values usually grow monotonically with insertion order, cluster around a small relative range (a few months, not 60 years), and have low Variance-to-Mean ratio compared to ID streams. None of that is currently checked.
+
+**5. Far-past epoch values silently dropped** — `epoch_guess` requires `all_non_negative`, so negative epochs (before 1970) are excluded. The 2.5e9-second gap below `9e8` (the seconds window floor) covers most of the 1970–2001 epoch range, which is plausibly legacy log data. We err toward false-negative here on purpose; mentioning it so it's not a surprise when "but the data is from 1995" comes up.
+
+**6. Sub-second precision serialized as float** — `1705314600.5` (epoch seconds with fractional part) currently fails `integer_valued`, so `epoch_guess` rejects it. Lots of systems emit fractional epochs; we miss them today.
+
+**7. JavaScript precision loss** — values above 2^53 (~9e15) lose i64 precision when round-tripped through a JS `number`. A 2024 epoch-nanos value (~1.7e18) is well past 2^53 and arrives at the analyzer as f64 with non-zero fractional part — same fate as #6. JavaScript pipelines pin epoch-millis, not nanos, so this rarely bites; but as nanosecond precision spreads (Iceberg, ClickHouse), it will.
+
+The `TimestampStats` tracker, when built, should treat these as the *test suite*: a field is correctly identified if and only if every case above is either flagged with the right precision, flagged with explicit ambiguity (resolution-mixed), or explicitly rejected (snowflake-shaped, counter-shaped). The current windows are good enough as a one-shot heuristic; a stats tracker with corroborating signal is what closes the boundary conditions.
 
 The trait surface stays uniform — `source.within(predicate)` — but each source exposes builder methods for the strategy slot: `.with_time_field(path, parser)`, `.with_broker_time()`, `.with_column("ingested_at")`, etc. Default strategies are the no-config common case; overrides handle the rest.
 
