@@ -7,6 +7,10 @@ license.workspace = true
 description = "Structural shape inference over streams of typed values"
 
 [dependencies]
-meta-types = { path = "../_meta/rust-types" }
+meta-types.workspace = true
 chrono.workspace = true
 dateparser.workspace = true
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"

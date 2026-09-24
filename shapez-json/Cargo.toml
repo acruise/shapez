@@ -8,7 +8,7 @@ description = "JSON feedstock adapter for shapez"
 
 [dependencies]
 shapez = { path = "../shapez" }
-meta-types = { path = "../_meta/rust-types" }
+meta-types.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["unbounded_depth"] }
 rand.workspace = true

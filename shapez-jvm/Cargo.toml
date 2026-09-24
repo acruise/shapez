@@ -1,0 +1,19 @@
+[package]
+name = "shapez-jvm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "JVM (JNA-friendly C ABI) FFI bindings for shapez"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+shapez = { path = "../shapez" }
+shapez-json = { path = "../shapez-json" }
+serde_json.workspace = true
+
+[dev-dependencies]
+prost = "0.13"

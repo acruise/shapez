@@ -967,6 +967,15 @@ impl StreamingAnalyzer {
         out
     }
 
+    /// Encode the analyzer's current state as a protobuf-serialized
+    /// [`crate::report::proto::AnalysisReport`]. Wire format and
+    /// schema are defined in `shapez/proto/report.proto`. Walks
+    /// `&self` so callers can serialize without consuming the
+    /// analyzer.
+    pub fn report_proto(&self) -> Vec<u8> {
+        crate::report::analyzer_report_bytes(self)
+    }
+
     /// Plain-language paragraph describing the root shape and the
     /// decisions that resolved it. Deterministic, ~2-5 lines. Callable
     /// independently of `report()` for callers that only want the
@@ -1989,8 +1998,16 @@ impl JsonEventSink for StreamingAnalyzer {
 
 impl Analyzer for StreamingAnalyzer {
     fn finish(self) -> ShapeNode {
-        let StreamingAnalyzer { arena, root, .. } = self;
-        Finalizer { arena }.build(root)
+        self.build_shape()
+    }
+}
+
+impl StreamingAnalyzer {
+    /// Build the analyzer's current shape tree without consuming it.
+    /// Useful for callers that want to inspect, re-render, or
+    /// serialize the analysis incrementally and keep feeding.
+    pub fn build_shape(&self) -> ShapeNode {
+        Finalizer { arena: &self.arena }.build(self.root)
     }
 }
 
@@ -1998,11 +2015,11 @@ impl Analyzer for StreamingAnalyzer {
 // Finalization
 // ---------------------------------------------------------------------------
 
-struct Finalizer {
-    arena: Vec<Node>,
+struct Finalizer<'a> {
+    arena: &'a [Node],
 }
 
-impl Finalizer {
+impl<'a> Finalizer<'a> {
     fn build(&self, id: NodeId) -> ShapeNode {
         let n = &self.arena[id];
         let mut arms: Vec<ShapeNode> = Vec::new();
@@ -2771,5 +2788,543 @@ mod tests {
             other => panic!("expected Variant at element, got {other:?}"),
         };
         assert_eq!(arms.len(), 3, "three variant arms expected");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State serialization — for Spark UDAGG-style use. See `crate::state` for
+// the public API; the per-type conversion methods live here to keep the
+// internal types' fields private.
+// ---------------------------------------------------------------------------
+
+mod state_conv {
+    use super::*;
+    use crate::state::proto;
+
+    impl ScalarKind {
+        pub(crate) fn to_state_proto(self) -> proto::ScalarKind {
+            match self {
+                ScalarKind::Null => proto::ScalarKind::Null,
+                ScalarKind::Bool => proto::ScalarKind::Bool,
+                ScalarKind::I64 => proto::ScalarKind::I64,
+                ScalarKind::U64 => proto::ScalarKind::U64,
+                ScalarKind::F64 => proto::ScalarKind::F64,
+                ScalarKind::String => proto::ScalarKind::String,
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: proto::ScalarKind) -> Option<Self> {
+            match p {
+                proto::ScalarKind::Unspecified => None,
+                proto::ScalarKind::Null => Some(ScalarKind::Null),
+                proto::ScalarKind::Bool => Some(ScalarKind::Bool),
+                proto::ScalarKind::I64 => Some(ScalarKind::I64),
+                proto::ScalarKind::U64 => Some(ScalarKind::U64),
+                proto::ScalarKind::F64 => Some(ScalarKind::F64),
+                proto::ScalarKind::String => Some(ScalarKind::String),
+            }
+        }
+    }
+
+    impl StringFormat {
+        pub(crate) fn to_state_proto(self) -> proto::StringFormat {
+            match self {
+                StringFormat::Uuid => proto::StringFormat::Uuid,
+                StringFormat::IsoTimestamp => proto::StringFormat::IsoTimestamp,
+                StringFormat::IsoDate => proto::StringFormat::IsoDate,
+                StringFormat::Ipv4 => proto::StringFormat::Ipv4,
+                StringFormat::Ipv6 => proto::StringFormat::Ipv6,
+                StringFormat::Email => proto::StringFormat::Email,
+                StringFormat::UrlHttp => proto::StringFormat::UrlHttp,
+                StringFormat::AllDigits => proto::StringFormat::AllDigits,
+                StringFormat::AllAlpha => proto::StringFormat::AllAlpha,
+                StringFormat::AlphaNum => proto::StringFormat::AlphaNum,
+                StringFormat::Other => proto::StringFormat::Other,
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: proto::StringFormat) -> Option<Self> {
+            match p {
+                proto::StringFormat::Unspecified => None,
+                proto::StringFormat::Uuid => Some(StringFormat::Uuid),
+                proto::StringFormat::IsoTimestamp => Some(StringFormat::IsoTimestamp),
+                proto::StringFormat::IsoDate => Some(StringFormat::IsoDate),
+                proto::StringFormat::Ipv4 => Some(StringFormat::Ipv4),
+                proto::StringFormat::Ipv6 => Some(StringFormat::Ipv6),
+                proto::StringFormat::Email => Some(StringFormat::Email),
+                proto::StringFormat::UrlHttp => Some(StringFormat::UrlHttp),
+                proto::StringFormat::AllDigits => Some(StringFormat::AllDigits),
+                proto::StringFormat::AllAlpha => Some(StringFormat::AllAlpha),
+                proto::StringFormat::AlphaNum => Some(StringFormat::AlphaNum),
+                proto::StringFormat::Other => Some(StringFormat::Other),
+            }
+        }
+    }
+
+    impl Sig {
+        pub(crate) fn to_state_proto(&self) -> proto::Sig {
+            let variant = match self {
+                Sig::Scalar(sk) => proto::sig::Variant::Scalar(proto::SigScalar {
+                    kind: sk.to_state_proto() as i32,
+                }),
+                Sig::Array(inner) => proto::sig::Variant::Array(Box::new(proto::SigArray {
+                    element: Some(Box::new(inner.to_state_proto())),
+                })),
+                Sig::Record(fields) => proto::sig::Variant::Record(proto::SigRecord {
+                    fields: fields
+                        .iter()
+                        .map(|(name, sig)| proto::SigRecordField {
+                            name: name.clone(),
+                            sig: Some(sig.to_state_proto()),
+                        })
+                        .collect(),
+                }),
+                Sig::Variant(arms) => proto::sig::Variant::VariantArm(proto::SigVariant {
+                    arms: arms.iter().map(|s| s.to_state_proto()).collect(),
+                }),
+                Sig::Empty => proto::sig::Variant::Empty(proto::SigEmpty {}),
+            };
+            proto::Sig { variant: Some(variant) }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::Sig) -> Self {
+            match p.variant.as_ref().expect("Sig.variant must be set") {
+                proto::sig::Variant::Scalar(s) => {
+                    let k = proto::ScalarKind::try_from(s.kind)
+                        .unwrap_or(proto::ScalarKind::Unspecified);
+                    Sig::Scalar(
+                        ScalarKind::from_state_proto(k).expect("SigScalar.kind must be set"),
+                    )
+                }
+                proto::sig::Variant::Array(a) => {
+                    let inner = Sig::from_state_proto(
+                        a.element.as_ref().expect("SigArray.element must be set"),
+                    );
+                    Sig::Array(Box::new(inner))
+                }
+                proto::sig::Variant::Record(r) => {
+                    let fields = r
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.name.clone(),
+                                Sig::from_state_proto(
+                                    f.sig.as_ref().expect("SigRecordField.sig must be set"),
+                                ),
+                            )
+                        })
+                        .collect();
+                    Sig::Record(fields)
+                }
+                proto::sig::Variant::VariantArm(v) => {
+                    Sig::Variant(v.arms.iter().map(Sig::from_state_proto).collect())
+                }
+                proto::sig::Variant::Empty(_) => Sig::Empty,
+            }
+        }
+    }
+
+    impl DistSketch {
+        pub(crate) fn to_state_proto(&self) -> proto::DistSketch {
+            proto::DistSketch {
+                gamma: self.gamma,
+                log_gamma: self.log_gamma,
+                cap: self.cap as u32,
+                pos: self
+                    .pos
+                    .iter()
+                    .map(|(&idx, &count)| proto::DistBucket { idx, count })
+                    .collect(),
+                neg: self
+                    .neg
+                    .iter()
+                    .map(|(&idx, &count)| proto::DistBucket { idx, count })
+                    .collect(),
+                zero_count: self.zero_count,
+                count: self.count,
+                min: self.min,
+                max: self.max,
+                sum: self.sum,
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::DistSketch) -> Self {
+            let mut pos = BTreeMap::new();
+            let mut neg = BTreeMap::new();
+            for b in &p.pos {
+                pos.insert(b.idx, b.count);
+            }
+            for b in &p.neg {
+                neg.insert(b.idx, b.count);
+            }
+            Self {
+                gamma: p.gamma,
+                log_gamma: p.log_gamma,
+                cap: p.cap as usize,
+                pos,
+                neg,
+                zero_count: p.zero_count,
+                count: p.count,
+                min: p.min,
+                max: p.max,
+                sum: p.sum,
+            }
+        }
+    }
+
+    impl SpaceSaving<String> {
+        pub(crate) fn to_state_proto_string(&self) -> proto::SpaceSavingString {
+            // Sort for deterministic ordering on the wire.
+            let mut entries: Vec<(String, u64)> =
+                self.counters.iter().map(|(k, &c)| (k.clone(), c)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            proto::SpaceSavingString {
+                counters: entries
+                    .into_iter()
+                    .map(|(key, count)| proto::SpaceSavingStringCounter { key, count })
+                    .collect(),
+                cap: self.cap as u32,
+                evictions: self.evictions,
+            }
+        }
+
+        pub(crate) fn from_state_proto_string(p: &proto::SpaceSavingString) -> Self {
+            let mut s = SpaceSaving::<String>::new(p.cap as usize);
+            for c in &p.counters {
+                s.counters.insert(c.key.clone(), c.count);
+            }
+            s.evictions = p.evictions;
+            s
+        }
+    }
+
+    impl SpaceSaving<Sig> {
+        pub(crate) fn to_state_proto_sig(&self) -> proto::SpaceSavingSig {
+            let mut entries: Vec<(Sig, u64)> =
+                self.counters.iter().map(|(k, &c)| (k.clone(), c)).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            proto::SpaceSavingSig {
+                counters: entries
+                    .into_iter()
+                    .map(|(sig, count)| proto::SpaceSavingSigCounter {
+                        key: Some(sig.to_state_proto()),
+                        count,
+                    })
+                    .collect(),
+                cap: self.cap as u32,
+                evictions: self.evictions,
+            }
+        }
+
+        pub(crate) fn from_state_proto_sig(p: &proto::SpaceSavingSig) -> Self {
+            let mut s = SpaceSaving::<Sig>::new(p.cap as usize);
+            for c in &p.counters {
+                let sig =
+                    Sig::from_state_proto(c.key.as_ref().expect("SpaceSavingSigCounter.key must be set"));
+                s.counters.insert(sig, c.count);
+            }
+            s.evictions = p.evictions;
+            s
+        }
+    }
+
+    impl StringStats {
+        pub(crate) fn to_state_proto(&self) -> proto::StringStats {
+            proto::StringStats {
+                count: self.count,
+                min_len: self.min_len,
+                max_len: self.max_len,
+                sum_len: self.sum_len,
+                formats: self
+                    .formats
+                    .iter()
+                    .map(|(f, &c)| proto::StringFormatCount {
+                        format: f.to_state_proto() as i32,
+                        count: c,
+                    })
+                    .collect(),
+                length_buckets: self.length_buckets.to_vec(),
+                length_sketch: Some(self.length_sketch.to_state_proto()),
+                skeletons: Some(self.skeletons.to_state_proto_string()),
+                other_count: self.other_count,
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::StringStats) -> Self {
+            let mut formats = BTreeMap::new();
+            for fc in &p.formats {
+                let fp = proto::StringFormat::try_from(fc.format)
+                    .unwrap_or(proto::StringFormat::Unspecified);
+                if let Some(f) = StringFormat::from_state_proto(fp) {
+                    formats.insert(f, fc.count);
+                }
+            }
+            let mut length_buckets = [0u64; 32];
+            for (i, v) in p.length_buckets.iter().take(32).enumerate() {
+                length_buckets[i] = *v;
+            }
+            Self {
+                count: p.count,
+                min_len: p.min_len,
+                max_len: p.max_len,
+                sum_len: p.sum_len,
+                formats,
+                length_buckets,
+                length_sketch: p
+                    .length_sketch
+                    .as_ref()
+                    .map(DistSketch::from_state_proto)
+                    .unwrap_or_default(),
+                skeletons: p
+                    .skeletons
+                    .as_ref()
+                    .map(SpaceSaving::<String>::from_state_proto_string)
+                    .unwrap_or_else(|| SpaceSaving::new(16)),
+                other_count: p.other_count,
+            }
+        }
+    }
+
+    impl NumericStats {
+        pub(crate) fn to_state_proto(&self) -> proto::NumericStats {
+            proto::NumericStats {
+                count: self.count,
+                min: self.min,
+                max: self.max,
+                sum: self.sum,
+                negative: self.negative,
+                zero: self.zero,
+                positive: self.positive,
+                integer_valued: self.integer_valued,
+                sketch: Some(self.sketch.to_state_proto()),
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::NumericStats) -> Self {
+            Self {
+                count: p.count,
+                min: p.min,
+                max: p.max,
+                sum: p.sum,
+                negative: p.negative,
+                zero: p.zero,
+                positive: p.positive,
+                integer_valued: p.integer_valued,
+                sketch: p
+                    .sketch
+                    .as_ref()
+                    .map(DistSketch::from_state_proto)
+                    .unwrap_or_default(),
+            }
+        }
+    }
+
+    impl ObjectAcc {
+        pub(crate) fn to_state_proto(&self) -> proto::ObjectAcc {
+            proto::ObjectAcc {
+                obs: self.obs,
+                fields: self
+                    .fields
+                    .iter()
+                    .map(|(name, &node_id)| proto::ObjectField {
+                        name: name.clone(),
+                        node_id: node_id as u32,
+                    })
+                    .collect(),
+                field_order: self.field_order.clone(),
+                record_alive: self.record_alive,
+                map_value: self.map_value as u32,
+                key_count_sum: self.key_count_sum,
+                key_stats: Some(self.key_stats.to_state_proto()),
+                key_count_sketch: Some(self.key_count_sketch.to_state_proto()),
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::ObjectAcc) -> Self {
+            let mut fields = BTreeMap::new();
+            for f in &p.fields {
+                fields.insert(f.name.clone(), f.node_id as NodeId);
+            }
+            Self {
+                obs: p.obs,
+                fields,
+                field_order: p.field_order.clone(),
+                record_alive: p.record_alive,
+                map_value: p.map_value as NodeId,
+                key_count_sum: p.key_count_sum,
+                key_stats: p
+                    .key_stats
+                    .as_ref()
+                    .map(StringStats::from_state_proto)
+                    .unwrap_or_default(),
+                key_count_sketch: p
+                    .key_count_sketch
+                    .as_ref()
+                    .map(DistSketch::from_state_proto)
+                    .unwrap_or_default(),
+            }
+        }
+    }
+
+    impl ArrayAcc {
+        pub(crate) fn to_state_proto(&self) -> proto::ArrayAcc {
+            proto::ArrayAcc {
+                obs: self.obs,
+                positional: self.positional.iter().map(|&id| id as u32).collect(),
+                positional_alive: self.positional_alive,
+                bag_value: self.bag_value as u32,
+                length_sum: self.length_sum,
+                min_length: self.min_length,
+                max_length: self.max_length,
+                length_histogram: self
+                    .length_histogram
+                    .iter()
+                    .map(|(&length, &count)| proto::LengthBucket { length, count })
+                    .collect(),
+                length_sketch: Some(self.length_sketch.to_state_proto()),
+                element_cluster: Some(self.element_cluster.to_state_proto_sig()),
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::ArrayAcc) -> Self {
+            let mut length_histogram = BTreeMap::new();
+            for b in &p.length_histogram {
+                length_histogram.insert(b.length, b.count);
+            }
+            Self {
+                obs: p.obs,
+                positional: p.positional.iter().map(|&id| id as NodeId).collect(),
+                positional_alive: p.positional_alive,
+                bag_value: p.bag_value as NodeId,
+                length_sum: p.length_sum,
+                min_length: p.min_length,
+                max_length: p.max_length,
+                length_histogram,
+                length_sketch: p
+                    .length_sketch
+                    .as_ref()
+                    .map(DistSketch::from_state_proto)
+                    .unwrap_or_default(),
+                element_cluster: p
+                    .element_cluster
+                    .as_ref()
+                    .map(SpaceSaving::<Sig>::from_state_proto_sig)
+                    .unwrap_or_else(|| SpaceSaving::new(16)),
+            }
+        }
+    }
+
+    impl Node {
+        pub(crate) fn to_state_proto(&self) -> proto::Node {
+            proto::Node {
+                obs: self.obs,
+                first_doc: self.first_doc,
+                last_doc: self.last_doc,
+                scalar_arms: self
+                    .scalar_arms
+                    .iter()
+                    .map(|(&kind, &count)| proto::ScalarArmCount {
+                        kind: kind.to_state_proto() as i32,
+                        count,
+                    })
+                    .collect(),
+                string_stats: self.string_stats.as_ref().map(StringStats::to_state_proto),
+                numeric_stats: self.numeric_stats.as_ref().map(NumericStats::to_state_proto),
+                object: self.object.as_ref().map(ObjectAcc::to_state_proto),
+                array: self.array.as_ref().map(ArrayAcc::to_state_proto),
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::Node) -> Self {
+            let mut scalar_arms = BTreeMap::new();
+            for arm in &p.scalar_arms {
+                let kp = proto::ScalarKind::try_from(arm.kind)
+                    .unwrap_or(proto::ScalarKind::Unspecified);
+                if let Some(k) = ScalarKind::from_state_proto(kp) {
+                    scalar_arms.insert(k, arm.count);
+                }
+            }
+            Self {
+                obs: p.obs,
+                first_doc: p.first_doc,
+                last_doc: p.last_doc,
+                scalar_arms,
+                string_stats: p.string_stats.as_ref().map(StringStats::from_state_proto),
+                numeric_stats: p.numeric_stats.as_ref().map(NumericStats::from_state_proto),
+                object: p.object.as_ref().map(ObjectAcc::from_state_proto),
+                array: p.array.as_ref().map(ArrayAcc::from_state_proto),
+            }
+        }
+    }
+
+    impl AnalyzerPolicy {
+        pub(crate) fn to_state_proto(&self) -> proto::AnalyzerPolicy {
+            proto::AnalyzerPolicy {
+                record_view_cap: self.record_view_cap as u32,
+                positional_view_cap: self.positional_view_cap as u32,
+                cluster_cap: self.cluster_cap as u32,
+                reason: self.reason.clone(),
+                max_eviction_rate: self.max_eviction_rate,
+                max_docs: self.max_docs,
+                min_docs_before_bail: self.min_docs_before_bail,
+            }
+        }
+
+        pub(crate) fn from_state_proto(p: &proto::AnalyzerPolicy) -> Self {
+            Self {
+                record_view_cap: p.record_view_cap as usize,
+                positional_view_cap: p.positional_view_cap as usize,
+                cluster_cap: p.cluster_cap as usize,
+                reason: p.reason.clone(),
+                max_eviction_rate: p.max_eviction_rate,
+                max_docs: p.max_docs,
+                min_docs_before_bail: p.min_docs_before_bail,
+            }
+        }
+    }
+
+    impl StreamingAnalyzer {
+        /// Serialize the analyzer's current state to a proto. Panics
+        /// if the analyzer is mid-document (the traversal stack is
+        /// non-empty or a pending node is held); producers must reach
+        /// quiescence before snapshotting.
+        pub fn to_state_proto(&self) -> proto::AnalyzerState {
+            assert!(
+                self.stack.is_empty(),
+                "shapez analyzer must be quiescent (between documents) before serializing state",
+            );
+            assert!(
+                self.pending.is_none(),
+                "shapez analyzer must be quiescent (between documents) before serializing state",
+            );
+            proto::AnalyzerState {
+                doc_count: self.doc_count,
+                root: self.root as u32,
+                total_cluster_evictions: self.total_cluster_evictions,
+                policy: Some(self.policy.to_state_proto()),
+                arena: self.arena.iter().map(Node::to_state_proto).collect(),
+            }
+        }
+
+        /// Reconstruct an analyzer from a serialized state.
+        pub fn from_state_proto(p: &proto::AnalyzerState) -> Self {
+            let policy = p
+                .policy
+                .as_ref()
+                .map(AnalyzerPolicy::from_state_proto)
+                .unwrap_or_default();
+            let arena: Vec<Node> = p.arena.iter().map(Node::from_state_proto).collect();
+            Self {
+                arena,
+                root: p.root as NodeId,
+                doc_count: p.doc_count,
+                current_doc: p.doc_count,
+                pending: None,
+                stack: Vec::new(),
+                policy,
+                total_cluster_evictions: p.total_cluster_evictions,
+            }
+        }
     }
 }

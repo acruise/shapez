@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package shapez.report;
+
+// Analysis report emitted by `StreamingAnalyzer::report_proto`.
+//
+// This schema is a hand-rolled, shapez-specific contract. It does NOT
+// mirror the upstream meta type system: shapez only emits a handful of
+// leaf types (Null, Bool, I64, U64, F64, String) and a fixed set of
+// structural decisions (Variant, Tuple, Array, Record, Map, Absent),
+// so the report carries only those. If shapez ever starts emitting new
+// leaf categories (e.g. format-detected Uuid/Timestamp/Ipv4 as
+// first-class leaves, decimal-precision tracking, etc.), this is the
+// file to extend.
+//
+// Schema evolution: proto3 rules apply. Field numbers are immutable;
+// new variants in the oneofs are wire-compatible additions; new
+// LeafType enum values are wire-compatible (consumers should treat
+// unknown enum integers as "future leaf type").
+
+message AnalysisReport {
+  uint64 doc_count = 1;
+  ShapeNode shape = 2;
+}
+
+// Per-position descriptor mirroring the Rust `ShapeNode`.
+message ShapeNode {
+  Stats stats = 1;
+  ShapeKind kind = 2;
+}
+
+message Stats {
+  uint64 observation_count = 1;
+  uint64 first_doc_ordinal = 2;
+  uint64 last_doc_ordinal = 3;
+}
+
+// The variant a node committed to at finalization. Exactly one arm is
+// set; an unset oneof is equivalent to AbsentKind.
+message ShapeKind {
+  oneof variant {
+    LeafKind leaf = 1;
+    VariantKind variant_kind = 2;
+    TupleKind tuple = 3;
+    AbsentKind absent = 4;
+    ArrayKind array = 5;
+    RecordKind record = 6;
+    MapKind map = 7;
+  }
+}
+
+message LeafKind {
+  LeafType type = 1;
+}
+
+// Leaf-type alphabet shapez emits today. New variants are append-only;
+// consumers should tolerate unknown enum values they don't recognize.
+enum LeafType {
+  LEAF_TYPE_UNSPECIFIED = 0;
+  LEAF_TYPE_NULL = 1;
+  LEAF_TYPE_BOOL = 2;
+  LEAF_TYPE_I64 = 3;
+  LEAF_TYPE_U64 = 4;
+  LEAF_TYPE_F64 = 5;
+  LEAF_TYPE_STRING = 6;
+}
+
+message VariantKind {
+  repeated ShapeNode arms = 1;
+}
+
+message TupleKind {
+  repeated ShapeNode positions = 1;
+}
+
+message AbsentKind {}
+
+message ArrayKind {
+  ShapeNode element = 1;
+  bool elements_nullable = 2;
+}
+
+message RecordKind {
+  repeated ShapeField fields = 1;
+}
+
+message ShapeField {
+  string name = 1;
+  ShapeNode shape = 2;
+  bool nullable = 3;
+}
+
+message MapKind {
+  ShapeNode key = 1;
+  ShapeNode value = 2;
+  bool values_nullable = 3;
+}

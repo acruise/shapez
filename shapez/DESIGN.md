@@ -606,6 +606,8 @@ It's also the principle from *one person's syntax, another's semantics* taken to
 
 Scope-honesty: this is the kind of feature that runs for a year before it's reliable, and the design will look different by the time it lands. Captured here so the framing — bitstream → ngram fingerprints → speculative parallel parsing → recursive descent into chaos-shaped leaves — survives between sessions of actually working on it.
 
+See `SYNTAX_DISCOVERY.md` for the expanded design: the six steps above become numbered stages, stage 4's bankruptcy protocol gets the second clause it needs (parse success is the wrong criterion — a CSV parser never fails on JSON, it just reports one useless column), and winner selection turns out to be an MDL question the analyzer is already equipped to answer. Stages 0-2 — code-unit detection, ngram sketching, fingerprint scoring — are implemented in the `shapez-sniff` crate.
+
 ## Where this fits in a host system
 
 - **Ingest path.** The host routes documents into shapez (sampling-aware), receives per-tile schema and per-path promotion advice in return.

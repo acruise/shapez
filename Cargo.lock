@@ -320,11 +320,10 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 [[package]]
 name = "meta-types"
 version = "0.1.0"
+source = "git+https://github.com/acruise/_meta.git?rev=dc3746c7b6e394b30fd8d603e84a5ff7867f523d#dc3746c7b6e394b30fd8d603e84a5ff7867f523d"
 dependencies = [
  "prost",
  "prost-build",
- "serde",
- "serde_yaml",
 ]
 
 [[package]]
@@ -538,12 +537,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "ryu"
-version = "1.0.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -593,25 +586,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_yaml"
-version = "0.9.34+deprecated"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
-dependencies = [
- "indexmap",
- "itoa",
- "ryu",
- "serde",
- "unsafe-libyaml",
-]
-
-[[package]]
 name = "shapez"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "dateparser",
  "meta-types",
+ "prost",
+ "prost-build",
 ]
 
 [[package]]
@@ -634,6 +616,20 @@ dependencies = [
  "shapez",
  "shapez-gen",
 ]
+
+[[package]]
+name = "shapez-jvm"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "serde_json",
+ "shapez",
+ "shapez-json",
+]
+
+[[package]]
+name = "shapez-sniff"
+version = "0.1.0"
 
 [[package]]
 name = "shlex"
@@ -682,12 +678,6 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
-
-[[package]]
-name = "unsafe-libyaml"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "wasi"

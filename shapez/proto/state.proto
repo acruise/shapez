@@ -1,0 +1,220 @@
+syntax = "proto3";
+
+package shapez.state;
+
+// In-progress analyzer state. Designed for Spark UDAGG-style use:
+// - `zero` is a fresh AnalyzerState (empty arena with a root node)
+// - `reduce(state, row)` is deserialize → feed → serialize
+// - `merge(state1, state2)` is the open work; per-sketch merge functions
+//   live in shapez core when ready
+// - `finish(state)` is deserialize → produce AnalysisReport
+//
+// Serialization captures the analyzer's *quiescent* state — between
+// documents. The mid-document traversal stack and pending-node pointer
+// are intentionally not captured; serializing mid-traversal is a bug.
+//
+// Schema evolution: proto3 rules apply. Existing field numbers and
+// enum values are immutable. The schema is shapez-internal — nothing
+// outside this crate is meant to author it, so we don't promise wire
+// compatibility across shapez revisions yet.
+
+message AnalyzerState {
+  uint64 doc_count = 1;
+  uint32 root = 2;
+  uint64 total_cluster_evictions = 3;
+  AnalyzerPolicy policy = 4;
+  repeated Node arena = 5;
+}
+
+message AnalyzerPolicy {
+  uint32 record_view_cap = 1;
+  uint32 positional_view_cap = 2;
+  uint32 cluster_cap = 3;
+  string reason = 4;
+  // Both encoded as optional so None and Some(0) are distinguishable.
+  optional double max_eviction_rate = 5;
+  optional uint64 max_docs = 6;
+  uint64 min_docs_before_bail = 7;
+}
+
+message Node {
+  uint64 obs = 1;
+  uint64 first_doc = 2;
+  uint64 last_doc = 3;
+  // Materialized as a repeated list because protobuf's map<> requires a
+  // scalar key type — we use the same shape for ergonomic deterministic
+  // ordering during testing.
+  repeated ScalarArmCount scalar_arms = 4;
+  optional StringStats string_stats = 5;
+  optional NumericStats numeric_stats = 6;
+  optional ObjectAcc object = 7;
+  optional ArrayAcc array = 8;
+}
+
+message ScalarArmCount {
+  ScalarKind kind = 1;
+  uint64 count = 2;
+}
+
+enum ScalarKind {
+  SCALAR_KIND_UNSPECIFIED = 0;
+  SCALAR_KIND_NULL = 1;
+  SCALAR_KIND_BOOL = 2;
+  SCALAR_KIND_I64 = 3;
+  SCALAR_KIND_U64 = 4;
+  SCALAR_KIND_F64 = 5;
+  SCALAR_KIND_STRING = 6;
+}
+
+message ObjectAcc {
+  uint64 obs = 1;
+  // BTreeMap<String, NodeId> rendered as a sorted list.
+  repeated ObjectField fields = 2;
+  repeated string field_order = 3;
+  bool record_alive = 4;
+  uint32 map_value = 5;
+  uint64 key_count_sum = 6;
+  StringStats key_stats = 7;
+  DistSketch key_count_sketch = 8;
+}
+
+message ObjectField {
+  string name = 1;
+  uint32 node_id = 2;
+}
+
+message ArrayAcc {
+  uint64 obs = 1;
+  repeated uint32 positional = 2;
+  bool positional_alive = 3;
+  uint32 bag_value = 4;
+  uint64 length_sum = 5;
+  uint32 min_length = 6;
+  uint32 max_length = 7;
+  repeated LengthBucket length_histogram = 8;
+  DistSketch length_sketch = 9;
+  SpaceSavingSig element_cluster = 10;
+}
+
+message LengthBucket {
+  uint32 length = 1;
+  uint64 count = 2;
+}
+
+message StringStats {
+  uint64 count = 1;
+  uint32 min_len = 2;
+  uint32 max_len = 3;
+  uint64 sum_len = 4;
+  repeated StringFormatCount formats = 5;
+  // Always 32 entries, log2-length buckets.
+  repeated uint64 length_buckets = 6;
+  DistSketch length_sketch = 7;
+  SpaceSavingString skeletons = 8;
+  uint64 other_count = 9;
+}
+
+message StringFormatCount {
+  StringFormat format = 1;
+  uint64 count = 2;
+}
+
+enum StringFormat {
+  STRING_FORMAT_UNSPECIFIED = 0;
+  STRING_FORMAT_UUID = 1;
+  STRING_FORMAT_ISO_TIMESTAMP = 2;
+  STRING_FORMAT_ISO_DATE = 3;
+  STRING_FORMAT_IPV4 = 4;
+  STRING_FORMAT_IPV6 = 5;
+  STRING_FORMAT_EMAIL = 6;
+  STRING_FORMAT_URL_HTTP = 7;
+  STRING_FORMAT_ALL_DIGITS = 8;
+  STRING_FORMAT_ALL_ALPHA = 9;
+  STRING_FORMAT_ALPHA_NUM = 10;
+  STRING_FORMAT_OTHER = 11;
+}
+
+message NumericStats {
+  uint64 count = 1;
+  double min = 2;
+  double max = 3;
+  double sum = 4;
+  uint64 negative = 5;
+  uint64 zero = 6;
+  uint64 positive = 7;
+  uint64 integer_valued = 8;
+  DistSketch sketch = 9;
+}
+
+message DistSketch {
+  double gamma = 1;
+  double log_gamma = 2;
+  uint32 cap = 3;
+  repeated DistBucket pos = 4;
+  repeated DistBucket neg = 5;
+  uint64 zero_count = 6;
+  uint64 count = 7;
+  double min = 8;
+  double max = 9;
+  double sum = 10;
+}
+
+message DistBucket {
+  sint32 idx = 1;
+  uint64 count = 2;
+}
+
+message SpaceSavingString {
+  repeated SpaceSavingStringCounter counters = 1;
+  uint32 cap = 2;
+  uint64 evictions = 3;
+}
+
+message SpaceSavingStringCounter {
+  string key = 1;
+  uint64 count = 2;
+}
+
+message SpaceSavingSig {
+  repeated SpaceSavingSigCounter counters = 1;
+  uint32 cap = 2;
+  uint64 evictions = 3;
+}
+
+message SpaceSavingSigCounter {
+  Sig key = 1;
+  uint64 count = 2;
+}
+
+message Sig {
+  oneof variant {
+    SigScalar scalar = 1;
+    SigArray array = 2;
+    SigRecord record = 3;
+    SigVariant variant_arm = 4;
+    SigEmpty empty = 5;
+  }
+}
+
+message SigScalar {
+  ScalarKind kind = 1;
+}
+
+message SigArray {
+  Sig element = 1;
+}
+
+message SigRecord {
+  repeated SigRecordField fields = 1;
+}
+
+message SigRecordField {
+  string name = 1;
+  Sig sig = 2;
+}
+
+message SigVariant {
+  repeated Sig arms = 1;
+}
+
+message SigEmpty {}
